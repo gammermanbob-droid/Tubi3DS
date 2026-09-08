@@ -534,6 +534,44 @@ static std::string pickManifestUrl(const picojson::value& videoObj) {
     return "";
 }
 
+// This is the actual answer to the "no subtitle logs" investigation: real
+// hardware logging (catalog_debug.txt, a resolve() of a Tubi movie/episode)
+// showed subtitles=0 on every VOD master playlist parsed -- Tubi's HLS
+// masters here carry NO #EXT-X-MEDIA:TYPE=SUBTITLES tags at all, ever.
+// Cross-checked against yt-dlp's own Tubi extractor (yt_dlp/extractor/
+// tubitv.py), a maintained, independent reference for Tubi's undocumented
+// API shape already used elsewhere in this codebase (see channels()'s EPG
+// comment and pickManifestUrl() above): it doesn't look at the HLS master
+// for subtitles either -- it reads a flat `subtitles` array living directly
+// on the SAME video JSON object as video_resources (videoById's entry,
+// already fetched by resolve() below), each element `{url, lang}`, and
+// downloads `url` as a complete, standalone file (no HLS/segment handling
+// around it), defaulting the display language to "English" when `lang` is
+// absent. That confirms these are plain single-file subtitle downloads
+// (WebVTT, going by what an HTML5 <video> player like Tubi's web client
+// actually consumes), not a segmented HLS rendition.
+static std::string pickSubtitleUrl(const picojson::value& videoObj, std::string* langOut) {
+    // English-language entry preferred to match this app's single-language
+    // Playback::subtitleVtt slot (no per-language selection UI exists);
+    // otherwise the first usable entry, same "something is better than
+    // nothing" fallback pickManifestUrl() above uses for video resources.
+    std::string firstUrl, firstLang;
+    for (const auto& sub : arrayField(videoObj,"subtitles")) {
+        std::string u = str(sub,"url");
+        if (u.empty()) continue;
+        u = fixUrl(u);
+        std::string lang = str(sub,"lang");
+        if (firstUrl.empty()) { firstUrl = u; firstLang = lang; }
+        if (lang.empty() || lang=="en" || lang=="eng" ||
+            lang.rfind("en-",0)==0 || lang.rfind("English",0)==0) {
+            if (langOut) *langOut = lang.empty() ? "English" : lang;
+            return u;
+        }
+    }
+    if (langOut) *langOut = firstLang;
+    return firstUrl;
+}
+
 // Tubi can offer an HEVC-coded rendition for a title (typically alongside,
 // or instead of, an H.264 one for a 4K/HDR master) via the exact same
 // video_resources/hlsv6 path pickManifestUrl() already prefers second --
@@ -575,6 +613,11 @@ static bool isHevcCodec(const std::string& codecs) {
 Playback Catalog::resolve(const Entry& e, int variantAttempt) {
     error.clear();
     Playback p;
+    // Set below, inside the movie/episode branch, from the same video JSON
+    // object video_resources comes from (see pickSubtitleUrl() above) --
+    // channels never have one (Tubi's live EPG rows carry no subtitles
+    // field at all), so this simply stays empty for those.
+    std::string subtitleUrl, subtitleLang;
     std::string manifestUrl = e.url;   // channels arrive with this already filled in
     if (!manifestUrl.empty()) {
         // Channel manifest URLs specifically (VOD's manifestUrl comes from
@@ -603,6 +646,7 @@ Playback Catalog::resolve(const Entry& e, int variantAttempt) {
         auto it = videoById.find(e.id);
         if (it==videoById.end()) { p.error="Tubi has no playback data for this title"; return p; }
         manifestUrl = pickManifestUrl(it->second);
+        subtitleUrl = pickSubtitleUrl(it->second, &subtitleLang);
     }
     if (manifestUrl.empty()) { p.error="No stream available for this title"; return p; }
 
@@ -717,5 +761,36 @@ Playback Catalog::resolve(const Entry& e, int variantAttempt) {
     if (finalUrl.empty()) { p.error="No playable video formats"; return p; }
     p.url = finalUrl;
     p.duration = e.duration;
+
+    // Subtitle fetch -- see pickSubtitleUrl() above for why this reads a
+    // flat `subtitles` array off the video's own JSON object rather than
+    // looking at the HLS master (confirmed empty there by real hardware
+    // logging: catalog_debug.txt showed subtitles=0 on every VOD master
+    // this app has ever parsed). subtitleUrl was only ever populated in the
+    // movie/episode branch above, so this is a deliberate no-op for
+    // channels (Tubi's live EPG rows carry no subtitles field to read).
+    if (e.kind=="channel") {
+        p.subtitleDebug = "no subtitles (live channel)\n";
+    } else if (subtitleUrl.empty()) {
+        p.subtitleDebug = "no subtitle entries found on this title's video page\n";
+    } else {
+        auto sr = get(subtitleUrl);
+        p.subtitleDebug = "subtitle lang=" + (subtitleLang.empty() ? std::string("?") : subtitleLang) +
+                           " url=" + redactUrl(subtitleUrl) +
+                           " httpStatus=" + std::to_string(sr.status) +
+                           " bytes=" + std::to_string(sr.body.size());
+        if (sr.ok() && !sr.body.empty()) {
+            p.subtitleVtt = sr.body;
+        } else {
+            p.subtitleDebug += " (fetch failed, no subtitles will show)";
+        }
+        p.subtitleDebug += "\n";   // player.cpp's dbg log prints this with a bare %s
+                                    // (see player.cpp's use of Playback::subtitleDebug),
+                                    // immediately followed by its own "subtitle cues=..."
+                                    // line -- without this trailing newline the two run
+                                    // together on one unreadable line.
+    }
+    appendDebug("%s", p.subtitleDebug.c_str());
+
     return p;
 }
