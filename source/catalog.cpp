@@ -475,13 +475,31 @@ Playback Catalog::resolve(const Entry& e, int variantAttempt) {
     // something else, instead of continuing to infer it from which derived
     // rendition 404s three layers downstream.
     if (!e.url.empty()) {
-        appendDebug("\nresolve channel id=%s title=%s attempt=%d masterUrl=%s httpStatus=%lu error=%08lX bodyBytes=%lu\n",
+        appendDebug("\nresolve channel id=%s title=%s attempt=%d masterUrl=%s finalUrl=%s httpStatus=%lu error=%08lX bodyBytes=%lu\n",
                     e.id.c_str(), e.title.c_str(), variantAttempt, redactUrl(manifestUrl).c_str(),
+                    redactUrl(r.finalUrl).c_str(),
                     (unsigned long)r.status, (unsigned long)r.error, (unsigned long)r.body.size());
         appendDebug("masterBody(first 1000B, redacted):\n%s\n", redactLines(r.body, 1000).c_str());
     }
     if (!r.ok()) { p.error="Playback unavailable ("+std::to_string(r.status)+")"; return p; }
     auto master = hls::parse(r.body);
+
+    // get()/fetch() follows redirects internally and r.body is whatever the
+    // LAST hop actually returned, but a variant URI inside that body which
+    // happens to be an absolute path (leading '/' -- confirmed to be exactly
+    // what Tubi's live master playlists use here, see catalog_debug.txt's
+    // masterBody dumps) needs to be resolved against wherever the content
+    // actually came from, not the URL that was originally requested. Using
+    // manifestUrl (pre-redirect) here reconstructs every derived rendition
+    // URL against the wrong host whenever the master fetch itself
+    // redirects -- confirmed via http_debug.txt logging status=302 on every
+    // single one of these live-channel master fetches, which had gone
+    // completely unnoticed because get()/fetch() silently absorbs the
+    // redirect chain and only ever handed callers the original request URL
+    // to resolve against. This is suspected as the actual root cause behind
+    // every prior fix (fMP4 probe skip, ABR cycling, URL normalize/DRM
+    // filter, cookie jar) failing to change the symptom at all.
+    const std::string& masterBaseUrl = r.finalUrl.empty() ? manifestUrl : r.finalUrl;
 
     std::string finalUrl;
     if (!master.variants.empty()) {
@@ -497,18 +515,18 @@ Playback Catalog::resolve(const Entry& e, int variantAttempt) {
                    ? (size_t)variantAttempt % byBandwidth.size()
                    : 0;
         const auto& v = byBandwidth[idx];
-        finalUrl = hls::resolve(manifestUrl, v.uri);
+        finalUrl = hls::resolve(masterBaseUrl, v.uri);
         if (!v.audio.empty()) {
             std::string best;
             for (const auto& a : master.audio) {
                 if (a.groupId!=v.audio) continue;
                 if (best.empty() || a.isDefault) best=a.uri;
             }
-            if (!best.empty()) p.audioUrl = hls::resolve(manifestUrl, best);
+            if (!best.empty()) p.audioUrl = hls::resolve(masterBaseUrl, best);
         }
     } else if (!master.segments.empty()) {
         // manifestUrl was already a media (not master) playlist.
-        finalUrl = manifestUrl;
+        finalUrl = masterBaseUrl;
     }
     if (finalUrl.empty()) { p.error="No playable video formats"; return p; }
     p.url = finalUrl;

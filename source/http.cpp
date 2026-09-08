@@ -56,6 +56,12 @@ static std::string originOf(const std::string& url) {
 
 static Response fetch(const std::string& url,const std::string& token,unsigned redirects) {
     Response out;
+    // Default/terminal-case value: this call's own URL. When a redirect is
+    // followed below, we return the recursive call's Response directly (its
+    // own out.finalUrl, set the same way against ITS url), so this ends up
+    // correctly propagating the last hop's URL all the way back up the
+    // chain without needing to thread it through explicitly.
+    out.finalUrl = url;
     if(url.rfind("https://",0)!=0) { out.error=-1; return out; }
     httpcContext ctx;
     out.error=httpcOpenContext(&ctx,HTTPC_METHOD_GET,url.c_str(),1);
@@ -118,6 +124,17 @@ static Response fetch(const std::string& url,const std::string& token,unsigned r
        (out.status==301 || out.status==302 || out.status==303 || out.status==307 || out.status==308)) {
         char target[8192]={};
         if(R_SUCCEEDED(httpcGetResponseHeader(&ctx,"Location",target,sizeof(target)))) location=hls::resolve(url,target);
+    }
+    if (isLiveManifest && !location.empty()) {
+        // Whether the redirect target lands on a DIFFERENT origin matters a
+        // lot here: any absolute-path reference inside the response body
+        // (an HLS master's variant URIs, for this specific 404 investigation)
+        // needs to be resolved against wherever the content actually came
+        // from, not the URL that was originally requested -- see
+        // Response::finalUrl and its use in Catalog::resolve().
+        auto origin=[](const std::string& u){ auto p=u.find("://");return u.substr(0,u.find('/',p+3)); };
+        httpDebugLog("  -> redirected to %s (%s origin)\n", redactUrlForLog(location).c_str(),
+                     origin(location)==origin(url) ? "same" : "DIFFERENT");
     }
     httpcCancelConnection(&ctx); httpcCloseContext(&ctx);
     if(!location.empty()) {
