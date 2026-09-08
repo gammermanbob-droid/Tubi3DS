@@ -820,6 +820,16 @@ static void dlThread(void* arg) {
         if(playlist.fragmented || !playlist.variants.empty() || response.body.rfind("#EXTM3U",0)!=0) {
             DLOG(r->dbg,"Unsupported playlist container\n"); break;
         }
+        // Resolve segment/key URIs against where this playlist fetch
+        // actually landed, not r->playlistUrl itself -- get()/fetch()
+        // follows redirects internally and the caller never otherwise
+        // learns the final URL. Using the pre-redirect URL as the resolve
+        // base silently reconstructs every relative/absolute-path
+        // reference against the wrong host whenever the playlist fetch
+        // redirects (see Catalog::resolve()'s identical fix and its
+        // comment for the confirmed live-channel case this pattern came
+        // from).
+        const std::string& playlistBase = response.finalUrl.empty() ? r->playlistUrl : response.finalUrl;
         bool added=false,failed=false;
         double timeline=0;
         for(const auto& segment:playlist.segments) {
@@ -827,10 +837,10 @@ static void dlThread(void* arg) {
             if(r->startSec>0 && segment.duration>0 && timeline<=r->startSec) continue;
             if(r->consumerStop) break;
             if(haveLast && segment.sequence<=last) continue;
-            auto media=get(hls::resolve(r->playlistUrl,segment.uri));
-            if(!media.ok()) { DLOG(r->dbg,"Segment fetch HTTP=%lu result=%08lX scheme=%s\n",(unsigned long)media.status,(unsigned long)media.error,hls::resolve(r->playlistUrl,segment.uri).rfind("https://",0)==0?"https":"other"); failed=true; break; }
+            auto media=get(hls::resolve(playlistBase,segment.uri));
+            if(!media.ok()) { DLOG(r->dbg,"Segment fetch HTTP=%lu result=%08lX scheme=%s\n",(unsigned long)media.status,(unsigned long)media.error,hls::resolve(playlistBase,segment.uri).rfind("https://",0)==0?"https":"other"); failed=true; break; }
             if(segment.method=="AES-128") {
-                std::string nextKey=hls::resolve(r->playlistUrl,segment.key);
+                std::string nextKey=hls::resolve(playlistBase,segment.key);
                 if(segment.key.empty()) { failed=true; break; }
                 if(nextKey!=keyUrl) {
                     auto key=get(nextKey);
@@ -951,6 +961,10 @@ static void dlThreadFmp4(void* arg) {
         auto playlist = hls::parse(response.body);
         DLOG(ctx->dbg, "fmp4 playlist segments=%u end=%d bytes=%lu\n",
              (unsigned)playlist.segments.size(), playlist.end, (unsigned long)response.body.size());
+        // See the identical comment in dlThread(): resolve against where
+        // this fetch actually landed, not ctx->playlistUrl, since
+        // get()/fetch() absorbs redirects silently.
+        const std::string& playlistBase = response.finalUrl.empty() ? ctx->playlistUrl : response.finalUrl;
 
         bool added = false, failed = false;
         double timeline = 0;
@@ -960,7 +974,7 @@ static void dlThreadFmp4(void* arg) {
             if (q->consumerStop) break;
             if (haveLast && segment.sequence <= last) continue;
 
-            auto media = get(hls::resolve(ctx->playlistUrl, segment.uri));
+            auto media = get(hls::resolve(playlistBase, segment.uri));
             if (!media.ok()) {
                 DLOG(ctx->dbg, "fmp4 segment fetch HTTP=%lu result=%08lX\n",
                      (unsigned long)media.status, (unsigned long)media.error);
@@ -1460,7 +1474,20 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
         if (probe.ok()) {
             hls::Playlist pl = hls::parse(probe.body);
             if (pl.fragmented && !pl.initSegmentUri.empty()) {
-                Response initResp = get(hls::resolve(url, pl.initSegmentUri));
+                // Resolve against where the playlist fetch actually landed
+                // (probe.finalUrl), not the original url -- confirmed via a
+                // real player_debug.txt to be exactly why this probe was
+                // failing to detect genuinely-fragmented VOD content: this
+                // playlist fetch redirects, the init segment URI is a
+                // relative/absolute-path reference, and resolving it
+                // against the pre-redirect url silently built a broken
+                // init-segment URL, so the fetch below failed, vFmp4Track
+                // stayed null, and playback fell back to the TS path (which
+                // then immediately hit "Unsupported playlist container" on
+                // its own independent parse of the very same fragmented
+                // playlist). Same root cause and same fix shape as
+                // Catalog::resolve()'s identical bug for live channels.
+                Response initResp = get(hls::resolve(probe.finalUrl, pl.initSegmentUri));
                 if (initResp.ok() &&
                     mp4::parseInit(reinterpret_cast<const u8*>(initResp.body.data()),
                                    initResp.body.size(), vFmp4Init)) {
@@ -1473,7 +1500,8 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
             if (probeA.ok()) {
                 hls::Playlist pla = hls::parse(probeA.body);
                 if (pla.fragmented && !pla.initSegmentUri.empty()) {
-                    Response initRespA = get(hls::resolve(audioUrl, pla.initSegmentUri));
+                    // Same fix as the video probe above.
+                    Response initRespA = get(hls::resolve(probeA.finalUrl, pla.initSegmentUri));
                     if (initRespA.ok() &&
                         mp4::parseInit(reinterpret_cast<const u8*>(initRespA.body.data()),
                                        initRespA.body.size(), aFmp4Init)) {
