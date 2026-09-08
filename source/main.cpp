@@ -25,65 +25,61 @@ enum AppState {
 
 enum PendingLoad {
     LOAD_NONE,
-    LOAD_VOD,       // initial home load: Catalog::vod() + cover art
+    LOAD_VOD,       // Catalog::vod(), split into Shows/Movies (one shared scrape)
     LOAD_LIVETV,    // Catalog::channels() + icon art
     LOAD_SEARCH,    // Catalog::search(query), pushed as an item level
     LOAD_EPISODES,  // Catalog::episodes(series), pushed as an item level
 };
 
-// The two home-level menus, cycled with L/R.
-enum HomeMenu { HOME_VOD, HOME_LIVETV };
+// The three home-level menus, cycled with L/R -- same layout and order as
+// Pluto3DS's TV GUIDE / SHOWS / MOVIES tabs.
+enum HomeMenu { HOME_LIVETV = 0, HOME_SHOWS = 1, HOME_MOVIES = 2 };
 
 // ---- Globals ---------------------------------------------------------------
 
 static Catalog catalog;
 static AppState    state   = STATE_LOADING;
-static PendingLoad  pending = LOAD_VOD;
-static std::string  loadMsg = "Loading Tubi...";
+static PendingLoad  pending = LOAD_LIVETV;
+static std::string  loadMsg = "Loading guide...";
 static std::string  errorMsg;
 
 static C3D_RenderTarget *topScreen = nullptr, *botScreen = nullptr;
 static UI* ui = nullptr;
 
-// Fetching cover art is one HTTP request + JPEG decode per item; on a large
-// shelf list or episode list that adds up, so eager art-fetching is capped
-// at this many items per screen. Anything past the cap still shows (and is
-// fully playable/selectable) as a colored placeholder card, just without
-// artwork -- the same "fast mode" trade-off 3DSfinPlus's library screen
-// makes for large libraries. Raise this if hardware/network handles it fine.
+// Cover art is only fetched for the Live TV guide, whose channel count is
+// small and bounded. The Shows/Movies grids and any drilled-into level
+// (episodes/search results) can be long shelf lists, and fetching one HTTP
+// request + JPEG decode per poster there would make those screens slow to
+// load for little benefit on a grid you're mostly scanning by title -- so
+// those always show colored placeholder cards instead (see UI::drawContentGrid
+// / drawItemGrid). This cap only bounds the Live TV guide's icon fetch.
 static constexpr size_t MAX_COVER_FETCH = 60;
 
-// Home VOD grid (Menu 1): Tubi's home-page shelves (movies + series),
-// deduped. Fetched once per session.
-static std::vector<Entry>     vodEntries;
-static std::vector<C2D_Image> vodCovers;
-static std::vector<std::string> vodCoverData;
-static int  selVod = 0;
+// Shows/Movies (Menu 2/3): Tubi's home-page shelves, fetched once via a
+// single Catalog::vod() call and split by Entry::kind. No cover art.
+static std::vector<Entry> showsEntries;
+static std::vector<Entry> moviesEntries;
+static int  selShows  = 0;
+static int  selMovies = 0;
+static bool vodLoaded = false;
 
-// Live TV guide (Menu 2). Fetched once per session (lazily, the first time
-// the user switches into the menu).
-static std::vector<Entry>     liveChannels;
-static std::vector<C2D_Image> liveCovers;
+// Live TV guide (Menu 1). Fetched once per session (lazily, the first time
+// the user switches into the menu) -- the only screen with real cover art.
+static std::vector<Entry>       liveChannels;
+static std::vector<C2D_Image>   liveCovers;
 static std::vector<std::string> liveCoverData;
 static int  selLive = 0;
 static bool liveLoaded = false;
 
-static HomeMenu homeMenu = HOME_VOD;
+static HomeMenu homeMenu = HOME_LIVETV;
 static bool homeTouchWasHeld  = false;
 static bool itemsTouchWasHeld = false;
 
 // One drilled-into level: a series' episodes, or a page of search results.
-// Only ever one level deep from either home tab (there is no season level --
-// Catalog::episodes() already returns a flat, S/E-labelled list), so a
-// single-slot stack (rather than 3DSfinPlus's arbitrary-depth browseStack)
-// would do, but a small vector keeps popLevel()/pushLevel() simple and
-// leaves room for "drill into a series found via search" without special-
-// casing that path.
+// No cover art here either (see MAX_COVER_FETCH comment above).
 struct ItemLevel {
     std::string title;
     std::vector<Entry> items;
-    std::vector<std::string> coverData;
-    std::vector<C2D_Image>   covers;
     int sel = 0;
 };
 static std::vector<ItemLevel> browseStack;
@@ -91,97 +87,35 @@ static std::vector<ItemLevel> browseStack;
 static std::string searchQuery;
 static Entry        drillSeries; // series Entry to fetch episodes() for
 
-// ---- Cover-art helpers ------------------------------------------------------
+// ---- Cover-art helpers (Live TV guide only) ---------------------------------
 
-static void freeVodCovers() {
-    for (auto& im : vodCovers) Image_free(&im);
-    vodCovers.clear();
+static void freeCovers(std::vector<C2D_Image>& covers) {
+    for (auto& im : covers) Image_free(&im);
+    covers.clear();
 }
-static void buildVodTextures() {
-    freeVodCovers();
-    vodCovers.assign(vodEntries.size(), C2D_Image{});
-    for (size_t i = 0; i < vodCoverData.size() && i < vodCovers.size(); i++)
-        if (!vodCoverData[i].empty())
+static void buildCoverTextures(std::vector<C2D_Image>& covers,
+                               const std::vector<std::string>& coverData,
+                               size_t count) {
+    freeCovers(covers);
+    covers.assign(count, C2D_Image{});
+    for (size_t i = 0; i < coverData.size() && i < covers.size(); i++)
+        if (!coverData[i].empty())
             Image_loadFromMemory(
-                reinterpret_cast<const unsigned char*>(vodCoverData[i].data()),
-                vodCoverData[i].size(), &vodCovers[i]);
+                reinterpret_cast<const unsigned char*>(coverData[i].data()),
+                coverData[i].size(), &covers[i]);
 }
-static void fetchVodCovers() {
-    vodCoverData.assign(vodEntries.size(), std::string());
-    for (size_t i = 0; i < vodEntries.size() && i < MAX_COVER_FETCH; i++) {
-        if (vodEntries[i].logo.empty()) continue;
-        auto r = get(vodEntries[i].logo);
-        if (r.ok()) vodCoverData[i] = r.body;
+static void fetchCoverData(std::vector<std::string>& coverData,
+                           const std::vector<Entry>& entries) {
+    coverData.assign(entries.size(), std::string());
+    for (size_t i = 0; i < entries.size() && i < MAX_COVER_FETCH; i++) {
+        if (entries[i].logo.empty()) continue;
+        auto r = get(entries[i].logo);
+        if (r.ok()) coverData[i] = r.body;
     }
-    buildVodTextures();
-}
-
-static void freeLiveCovers() {
-    for (auto& im : liveCovers) Image_free(&im);
-    liveCovers.clear();
-}
-static void buildLiveTextures() {
-    freeLiveCovers();
-    liveCovers.assign(liveChannels.size(), C2D_Image{});
-    for (size_t i = 0; i < liveCoverData.size() && i < liveCovers.size(); i++)
-        if (!liveCoverData[i].empty())
-            Image_loadFromMemory(
-                reinterpret_cast<const unsigned char*>(liveCoverData[i].data()),
-                liveCoverData[i].size(), &liveCovers[i]);
 }
 static void fetchLiveCovers() {
-    liveCoverData.assign(liveChannels.size(), std::string());
-    for (size_t i = 0; i < liveChannels.size() && i < MAX_COVER_FETCH; i++) {
-        if (liveChannels[i].logo.empty()) continue;
-        auto r = get(liveChannels[i].logo);
-        if (r.ok()) liveCoverData[i] = r.body;
-    }
-    buildLiveTextures();
-}
-
-// ---- Browse-level helpers ---------------------------------------------------
-// Invariant (same as 3DSfinPlus): only the top level (browseStack.back())
-// holds live GPU textures.
-
-static void freeLevelCovers(ItemLevel& lv) {
-    for (auto& im : lv.covers) Image_free(&im);
-    lv.covers.clear();
-}
-static void buildLevelCovers(ItemLevel& lv) {
-    freeLevelCovers(lv);
-    lv.covers.assign(lv.items.size(), C2D_Image{});
-    for (size_t i = 0; i < lv.coverData.size() && i < lv.covers.size(); i++)
-        if (!lv.coverData[i].empty())
-            Image_loadFromMemory(
-                reinterpret_cast<const unsigned char*>(lv.coverData[i].data()),
-                lv.coverData[i].size(), &lv.covers[i]);
-}
-static void fetchLevelCovers(ItemLevel& lv) {
-    lv.coverData.assign(lv.items.size(), std::string());
-    for (size_t i = 0; i < lv.items.size() && i < MAX_COVER_FETCH; i++) {
-        if (lv.items[i].logo.empty()) continue;
-        auto r = get(lv.items[i].logo);
-        if (r.ok()) lv.coverData[i] = r.body;
-    }
-    buildLevelCovers(lv);
-}
-static void pushLevel(const std::string& title, std::vector<Entry> items) {
-    if (!browseStack.empty()) freeLevelCovers(browseStack.back());
-    ItemLevel lv;
-    lv.title = title;
-    lv.items = std::move(items);
-    browseStack.push_back(std::move(lv));
-    fetchLevelCovers(browseStack.back());
-}
-static void popLevel() {
-    if (browseStack.empty()) return;
-    freeLevelCovers(browseStack.back());
-    browseStack.pop_back();
-    if (!browseStack.empty()) buildLevelCovers(browseStack.back());
-}
-static void clearBrowse() {
-    if (!browseStack.empty()) freeLevelCovers(browseStack.back());
-    browseStack.clear();
+    fetchCoverData(liveCoverData, liveChannels);
+    buildCoverTextures(liveCovers, liveCoverData, liveChannels.size());
 }
 
 // ---- Graphics start/stop (also used around playback) -----------------------
@@ -202,12 +136,29 @@ static void graphicsStop() {
     topScreen = botScreen = nullptr;
 }
 
+// ---- Loading helper ----------------------------------------------------------
+
+// Queues the blocking load a given home tab needs (matching Pluto3DS's
+// per-tab lazy loading: the guide loads on its own, Shows/Movies share one
+// vod() fetch). Used both for L/R tab switches and for retrying after an
+// error.
+static void requestLoad(HomeMenu m) {
+    if (m == HOME_LIVETV) {
+        loadMsg = "Loading guide...";
+        pending = LOAD_LIVETV;
+    } else {
+        loadMsg = "Loading movies and shows...";
+        pending = LOAD_VOD;
+    }
+    state = STATE_LOADING;
+}
+
 // ---- Playback ---------------------------------------------------------------
 // No UI state of its own: resolve the entry, tear the GPU context down,
 // block in playerPlay() (with a seek-retry loop and, for live channels, the
-// same guide/renewal wiring Pluto3DS uses), then bring the GPU context back
-// up and resume wherever the UI loop left off. Mirrors Pluto3DS's main.cpp
-// control flow rather than 3DSfinPlus's STATE_PLAYER.
+// same renewal wiring Pluto3DS uses), then bring the GPU context back up and
+// resume wherever the UI loop left off. Mirrors Pluto3DS's main.cpp control
+// flow rather than 3DSfinPlus's STATE_PLAYER.
 
 static void playEntry(const Entry& e) {
     Playback data = catalog.resolve(e);
@@ -219,19 +170,17 @@ static void playEntry(const Entry& e) {
     }
 
     // Free GPU textures before tearing down the 3D context (playback owns
-    // both screens and all of VRAM while it runs).
-    freeVodCovers();
-    freeLiveCovers();
-    if (!browseStack.empty()) freeLevelCovers(browseStack.back());
+    // both screens and all of VRAM while it runs). Only the Live TV guide
+    // has any to free.
+    freeCovers(liveCovers);
     delete ui; ui = nullptr;
     graphicsStop();
 
     bool live = (e.kind == "channel");
     if (live) {
-        // No in-player guide overlay in this first cut (playerGuideDraw/
-        // Input left unset); only the renewal callback is wired, so a
-        // channel whose playlist expires mid-session gets a fresh one
-        // instead of just dying.
+        // No in-player guide overlay in this first cut; only the renewal
+        // callback is wired, so a channel whose playlist expires mid-session
+        // gets a fresh one instead of just dying.
         playerRenewUrl = [e]() -> std::pair<std::string, std::string> {
             Playback fresh = catalog.resolve(e);
             return { fresh.url, fresh.audioUrl };
@@ -256,9 +205,7 @@ static void playEntry(const Entry& e) {
         return;
     }
     ui = new UI(topScreen, botScreen);
-    buildVodTextures();
-    if (liveLoaded) buildLiveTextures();
-    if (!browseStack.empty()) buildLevelCovers(browseStack.back());
+    if (liveLoaded) buildCoverTextures(liveCovers, liveCoverData, liveChannels.size());
 }
 
 // ---- Software keyboard helper -----------------------------------------------
@@ -309,18 +256,25 @@ int main() {
         // --------------------------------------------------------------
         if (pending != LOAD_NONE) {
             switch (pending) {
-                case LOAD_VOD:
-                    vodEntries = catalog.vod();
-                    if (!catalog.error.empty()) {
+                case LOAD_VOD: {
+                    std::vector<Entry> all = catalog.vod();
+                    if (!catalog.error.empty() && all.empty()) {
                         errorMsg = catalog.error;
                         state = STATE_ERROR;
                         break;
                     }
-                    selVod = 0;
-                    homeMenu = HOME_VOD;
-                    fetchVodCovers();
+                    showsEntries.clear();
+                    moviesEntries.clear();
+                    for (auto& e : all) {
+                        if (e.kind == "series")      showsEntries.push_back(std::move(e));
+                        else if (e.kind == "movie")  moviesEntries.push_back(std::move(e));
+                    }
+                    selShows = 0;
+                    selMovies = 0;
+                    vodLoaded = true;
                     state = STATE_HOME;
                     break;
+                }
 
                 case LOAD_LIVETV:
                     liveChannels = catalog.channels();
@@ -335,15 +289,24 @@ int main() {
                     state = STATE_HOME;
                     break;
 
-                case LOAD_SEARCH:
-                    pushLevel("Search: " + searchQuery, catalog.search(searchQuery));
+                case LOAD_SEARCH: {
+                    if (!browseStack.empty()) browseStack.clear();
+                    ItemLevel lv;
+                    lv.title = "Search: " + searchQuery;
+                    lv.items = catalog.search(searchQuery);
+                    browseStack.push_back(std::move(lv));
                     state = STATE_ITEMS;
                     break;
+                }
 
-                case LOAD_EPISODES:
-                    pushLevel(drillSeries.title, catalog.episodes(drillSeries));
+                case LOAD_EPISODES: {
+                    ItemLevel lv;
+                    lv.title = drillSeries.title;
+                    lv.items = catalog.episodes(drillSeries);
+                    browseStack.push_back(std::move(lv));
                     state = STATE_ITEMS;
                     break;
+                }
 
                 default: break;
             }
@@ -358,14 +321,12 @@ int main() {
                 break;
 
             case STATE_HOME: {
-                // L/R cycle the two home menus.
+                // L/R cycle the three home menus.
                 if (kDown & (KEY_L | KEY_R)) {
-                    homeMenu = (homeMenu == HOME_VOD) ? HOME_LIVETV : HOME_VOD;
-                    if (homeMenu == HOME_LIVETV && !liveLoaded) {
-                        loadMsg = "Loading Live TV guide...";
-                        pending = LOAD_LIVETV;
-                        state   = STATE_LOADING;
-                    }
+                    int dir = (kDown & KEY_R) ? 1 : 2; // +1 or -1 (mod 3)
+                    homeMenu = (HomeMenu)(((int)homeMenu + dir) % 3);
+                    if (homeMenu == HOME_LIVETV && !liveLoaded) requestLoad(homeMenu);
+                    else if (homeMenu != HOME_LIVETV && !vodLoaded) requestLoad(homeMenu);
                     break;
                 }
 
@@ -374,13 +335,19 @@ int main() {
                 bool touching = (hidKeysHeld() & KEY_TOUCH) != 0;
                 int  touchHit = -1;
                 bool touchSearch = false;
+                std::vector<Entry>* curList = (homeMenu == HOME_SHOWS) ? &showsEntries
+                                             : (homeMenu == HOME_MOVIES) ? &moviesEntries
+                                             : nullptr;
+                int* curSel = (homeMenu == HOME_SHOWS) ? &selShows
+                            : (homeMenu == HOME_MOVIES) ? &selMovies
+                            : nullptr;
                 if (touching && !homeTouchWasHeld) {
                     touchPosition touch; hidTouchRead(&touch);
-                    if (homeMenu == HOME_VOD && touch.px >= UI::BOT_W - 72 && touch.py < 24) {
+                    if (curList && touch.px >= UI::BOT_W - 72 && touch.py < 24) {
                         touchSearch = true;
-                    } else if (homeMenu == HOME_VOD) {
+                    } else if (curList) {
                         touchHit = UI::hitTestBottomGrid(touch.px, touch.py,
-                                                          (int)vodEntries.size(), selVod);
+                                                          (int)curList->size(), *curSel);
                     } else {
                         touchHit = UI::hitTestLiveList(touch.px, touch.py,
                                                         (int)liveChannels.size(), selLive);
@@ -388,7 +355,7 @@ int main() {
                 }
                 homeTouchWasHeld = touching;
 
-                if (homeMenu == HOME_VOD) {
+                if (curList) {
                     if (touchSearch || (kDown & KEY_Y)) {
                         std::string q = swkbdRead("Search Tubi");
                         if (!q.empty()) {
@@ -400,16 +367,16 @@ int main() {
                         break;
                     }
 
-                    int n    = (int)vodEntries.size();
+                    int n    = (int)curList->size();
                     int cols = UI::BGRID_COLS;
-                    if (touchHit >= 0) selVod = touchHit;
-                    if (kDown & KEY_RIGHT && selVod < n - 1 && (selVod % cols) != cols - 1) selVod++;
-                    if (kDown & KEY_LEFT  && (selVod % cols) != 0)                          selVod--;
-                    if (kDown & KEY_DOWN  && selVod + cols < n)                             selVod += cols;
-                    if (kDown & KEY_UP    && selVod - cols >= 0)                            selVod -= cols;
+                    if (touchHit >= 0) *curSel = touchHit;
+                    if (kDown & KEY_RIGHT && *curSel < n - 1 && (*curSel % cols) != cols - 1) (*curSel)++;
+                    if (kDown & KEY_LEFT  && (*curSel % cols) != 0)                            (*curSel)--;
+                    if (kDown & KEY_DOWN  && *curSel + cols < n)                               *curSel += cols;
+                    if (kDown & KEY_UP    && *curSel - cols >= 0)                               *curSel -= cols;
 
                     if (kDown & KEY_A && n > 0) {
-                        const Entry& e = vodEntries[selVod];
+                        const Entry& e = (*curList)[*curSel];
                         if (e.kind == "series") {
                             drillSeries = e;
                             loadMsg = "Loading \"" + e.title + "\"...";
@@ -431,7 +398,7 @@ int main() {
 
             case STATE_ITEMS: {
                 if (kDown & KEY_B) {
-                    popLevel();
+                    browseStack.pop_back();
                     if (browseStack.empty()) state = STATE_HOME;
                     break;
                 }
@@ -469,16 +436,9 @@ int main() {
 
             case STATE_ERROR:
                 if (kDown & KEY_B) {
-                    // Back out to the home screen. If nothing has loaded
-                    // yet at all (e.g. the very first vod() call failed),
-                    // retry it instead of showing an empty grid.
-                    if (vodEntries.empty()) {
-                        loadMsg = "Loading Tubi...";
-                        pending = LOAD_VOD;
-                        state   = STATE_LOADING;
-                    } else {
-                        state = STATE_HOME;
-                    }
+                    bool haveAnything = vodLoaded || liveLoaded;
+                    if (haveAnything) state = STATE_HOME;
+                    else               requestLoad(homeMenu);
                 }
                 break;
         }
@@ -494,15 +454,17 @@ int main() {
                 break;
 
             case STATE_HOME:
-                if (homeMenu == HOME_VOD)
-                    ui->drawVodGrid(vodEntries, vodCovers, selVod);
-                else
+                if (homeMenu == HOME_LIVETV)
                     ui->drawLiveTvGuide(liveChannels, liveCovers, selLive);
+                else if (homeMenu == HOME_SHOWS)
+                    ui->drawContentGrid(showsEntries, {}, selShows, UI::TAB_SHOWS, "Shows");
+                else
+                    ui->drawContentGrid(moviesEntries, {}, selMovies, UI::TAB_MOVIES, "Movies");
                 break;
 
             case STATE_ITEMS: {
                 ItemLevel& lv = browseStack.back();
-                ui->drawItemGrid(lv.items, lv.covers, lv.sel, lv.title);
+                ui->drawItemGrid(lv.items, {}, lv.sel, lv.title);
                 break;
             }
 
@@ -514,9 +476,8 @@ int main() {
         ui->endFrame();
     }
 
-    freeVodCovers();
-    freeLiveCovers();
-    clearBrowse();
+    freeCovers(liveCovers);
+    browseStack.clear();
     delete ui;
     graphicsStop();
     if (R_SUCCEEDED(httpRes)) httpcExit();

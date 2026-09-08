@@ -262,17 +262,18 @@ void UI::drawLiveTvRows(const std::vector<Entry>& channels,
     }
 }
 
-// Tab strip shown on the top screen of both home menus.
+// Tab strip shown on the top screen of all three home menus, matching
+// Pluto3DS's TV GUIDE / SHOWS / MOVIES layout.
 void UI::drawHomeMenuTabs(HomeMenuTab active) {
-    const char* names[2] = {"Home", "Live TV"};
+    const char* names[3] = {"Live TV", "Shows", "Movies"};
     float y = 24.0f;
     drawRect(0, y, TOP_W, 20, COL_BG);
     float x = 8.0f;
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
         u32 col = (i == (int)active) ? COL_YELLOW : COL_GREY;
         std::string label = std::string(i == (int)active ? "> " : "  ") + names[i];
-        drawText(label, x, y + 2, 0.42f, col);
-        x += 160.0f;
+        drawText(label, x, y + 2, 0.40f, col);
+        x += 110.0f;
     }
     drawText("L/R", TOP_W - 34, y + 2, 0.38f, COL_GREY);
 }
@@ -310,15 +311,17 @@ int UI::hitTestLiveList(int touchX, int touchY, int count, int selected) {
     return idx;
 }
 
-void UI::drawVodGrid(const std::vector<Entry>& items,
-                     const std::vector<C2D_Image>& covers,
-                     int selected) {
+void UI::drawContentGrid(const std::vector<Entry>& items,
+                         const std::vector<C2D_Image>& covers,
+                         int selected,
+                         HomeMenuTab active,
+                         const std::string& title) {
     // Top screen: branding only. The grid itself lives only on the touchable
     // bottom screen (see below) so there is exactly one grid, never a second
     // one at a different column count that a D-Pad press could desync from.
     C2D_SceneBegin(top_);
-    drawTopBar("Home");
-    drawHomeMenuTabs(TAB_VOD);
+    drawTopBar(title);
+    drawHomeMenuTabs(active);
 
     drawTubiWordmark(TOP_W / 2.0f, 100.0f, 1.6f);
     drawText("Choose something to watch below", 78, 150, 0.45f, COL_GREY);
@@ -326,8 +329,11 @@ void UI::drawVodGrid(const std::vector<Entry>& items,
     if (items.empty())
         drawText("(nothing loaded)", 8, 216, 0.46f, COL_GREY);
 
-    // Bottom screen: the touchable VOD grid (the top screen has no
-    // digitizer, so this is the only way to select something by tapping it).
+    // Bottom screen: the touchable grid (the top screen has no digitizer,
+    // so this is the only way to select something by tapping it). No cover
+    // art is fetched for this screen (see main.cpp) to keep load times
+    // short on a potentially large shelf list -- every card falls back to
+    // a colored placeholder, same as an empty `covers` vector always did.
     C2D_SceneBegin(bot_);
     drawRect(0, 0, BOT_W, BOT_H, COL_BG_BOT);
 

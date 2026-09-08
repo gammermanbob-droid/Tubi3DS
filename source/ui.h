@@ -36,9 +36,11 @@ public:
     static constexpr float LIVE_ROW_H   = 46.0f;
     static constexpr int   LIVE_ROWS_V  = 4;
 
-    // Home-menu L/R tab strip. Only two menus: Tubi needs no login, so
-    // there's nothing to resume and no "Continue Watching" tab.
-    enum HomeMenuTab { TAB_VOD = 0, TAB_LIVETV = 1 };
+    // Home-menu L/R tab strip, matching Pluto3DS's layout (TV GUIDE / SHOWS
+    // / MOVIES) rather than 3DSfinPlus's single combined library grid. Tubi
+    // needs no login, so there's nothing to resume and no "Continue
+    // Watching" tab.
+    enum HomeMenuTab { TAB_LIVETV = 0, TAB_SHOWS = 1, TAB_MOVIES = 2 };
 
     UI(C3D_RenderTarget* top, C3D_RenderTarget* bot);
     ~UI();
@@ -49,16 +51,20 @@ public:
     void drawLoadingScreen(const std::string& msg);
     void drawErrorScreen(const std::string& msg);
 
-    // Home VOD grid (Menu 1): movies + series pulled from Tubi's home
-    // shelves. The touchable grid lives only on the bottom screen (the top
-    // screen has no digitizer); the top screen shows the "tubi" wordmark
-    // instead of a second, unsynced grid (no real Tubi logo asset is
-    // available, so this is styled text in Tubi's brand color).
-    void drawVodGrid(const std::vector<Entry>& items,
-                     const std::vector<C2D_Image>& covers,
-                     int selected);
+    // Shows or Movies grid (Menu 2/3, picked by `active`): a flat list of
+    // series or movies pulled from Tubi's home shelves. The touchable grid
+    // lives only on the bottom screen (the top screen has no digitizer);
+    // the top screen shows the "tubi" wordmark instead of a second,
+    // unsynced grid (no real Tubi logo asset is available, so this is
+    // styled text in Tubi's brand color). `title` is the top-bar label
+    // ("Shows" or "Movies").
+    void drawContentGrid(const std::vector<Entry>& items,
+                         const std::vector<C2D_Image>& covers,
+                         int selected,
+                         HomeMenuTab active,
+                         const std::string& title);
 
-    // Live TV guide (Menu 2): top screen shows the highlighted channel's
+    // Live TV guide (Menu 1): top screen shows the highlighted channel's
     // icon, name and current program; bottom screen lists every channel
     // with icon + current program, one row per channel, touchable. Only the
     // program airing right now is shown, no schedule look-ahead.
@@ -66,11 +72,11 @@ public:
                          const std::vector<C2D_Image>& icons,
                          int selected);
 
-    // Tab strip shared by both home menus ("L  Home · Live TV  R").
+    // Tab strip shared by all three home menus ("L  Live TV · Shows · Movies  R").
     void drawHomeMenuTabs(HomeMenuTab active);
 
     // Touch hit-testing for the bottom-screen mirror grid (see BGRID_* above).
-    // The visible page is derived from `selected` (same rule drawVodGrid/
+    // The visible page is derived from `selected` (same rule drawContentGrid/
     // drawItemGrid use), so this always matches what's currently drawn.
     // Returns the absolute item index under (touchX, touchY), or -1 if the
     // touch isn't over a card.
@@ -80,7 +86,7 @@ public:
     static int hitTestLiveList(int touchX, int touchY, int count, int selected);
 
     // A drilled-into level: a series' episodes, or search results. The
-    // touchable grid lives on the bottom screen only, matching drawVodGrid;
+    // touchable grid lives on the bottom screen only, matching drawContentGrid;
     // the top screen shows the level title and the "tubi" wordmark. covers
     // is parallel to items; a null tex falls back to a colored placeholder.
     void drawItemGrid(const std::vector<Entry>& items,
