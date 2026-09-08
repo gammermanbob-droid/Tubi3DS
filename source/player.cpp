@@ -1436,7 +1436,17 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
     mp4::InitInfo vFmp4Init, aFmp4Init;
     const mp4::TrackConfig* vFmp4Track = nullptr;
     const mp4::TrackConfig* aFmp4Track = nullptr;
-    {
+    // Live channels (runTimeTicks<=0 -- see the "zero duration denotes a live
+    // channel" comment on the seek keys below) never get this probe at all:
+    // fMP4 support is VOD/episodes-only to begin with (see dlThreadFmp4's
+    // header comment), and a live manifest URL can be a short-lived/one-shot
+    // signed link -- spending it here on a probe fetch instead of on the
+    // real download thread's first request has been observed to 404 every
+    // subsequent fetch (including after playerRenewUrl's "fresh" URL, which
+    // is really just this same resolve-then-probe-then-404 sequence
+    // repeating). Skipping the probe entirely for live is both correct scope
+    // and removes that risk outright.
+    if (runTimeTicks > 0) {
         Response probe = get(url);
         if (probe.ok()) {
             hls::Playlist pl = hls::parse(probe.body);
@@ -1470,6 +1480,9 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
                     audioUrl.empty() ? " empty" : " set");
             fflush(dbg);
         }
+    } else if (dbg) {
+        fprintf(dbg, "fMP4 detect: skipped (live channel)\n");
+        fflush(dbg);
     }
 
     // Linear memory buffers (g_ring.data is the background download ring).
