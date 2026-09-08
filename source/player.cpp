@@ -1868,5 +1868,11 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
     C2D_Fini();
     C3D_Fini();
     g_playbackHudTarget = nullptr;
-    return true;
+    // Zero frames ever displayed usually means the demuxer bailed on an
+    // unsupported playlist (see "Unsupported playlist container" in
+    // player_debug.txt -- e.g. a fragmented-MP4/CMAF HLS stream, which this
+    // decoder doesn't parse) rather than a real completed/stopped playback.
+    // Surfacing that as failure lets the caller show an error instead of
+    // silently landing back on the previous screen.
+    return g_dispCount > 0 || (seekOut && *seekOut >= 0);
 }
