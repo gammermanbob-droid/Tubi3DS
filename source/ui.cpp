@@ -262,18 +262,20 @@ void UI::drawLiveTvRows(const std::vector<Entry>& channels,
     }
 }
 
-// Tab strip shown on the top screen of all three home menus, matching
-// Pluto3DS's TV GUIDE / SHOWS / MOVIES layout.
+// Tab strip shown on the top screen of all four home menus, matching
+// Pluto3DS's TV GUIDE / SHOWS / MOVIES layout plus a 4th Browse tab (see
+// TAB_CATEGORIES). Spacing is tighter than the original 3-tab layout (92px
+// instead of 110px) so all four still fit within TOP_W=400.
 void UI::drawHomeMenuTabs(HomeMenuTab active) {
-    const char* names[3] = {"Live TV", "Shows", "Movies"};
+    const char* names[4] = {"Live TV", "Shows", "Movies", "Browse"};
     float y = 24.0f;
     drawRect(0, y, TOP_W, 20, COL_BG);
     float x = 8.0f;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
         u32 col = (i == (int)active) ? COL_YELLOW : COL_GREY;
         std::string label = std::string(i == (int)active ? "> " : "  ") + names[i];
         drawText(label, x, y + 2, 0.40f, col);
-        x += 110.0f;
+        x += 92.0f;
     }
     drawText("L/R", TOP_W - 34, y + 2, 0.38f, COL_GREY);
 }
@@ -308,6 +310,62 @@ int UI::hitTestLiveList(int touchX, int touchY, int count, int selected) {
     if (row < 0 || row >= LIVE_ROWS_V) return -1;
     int idx = base + row;
     if (idx < 0 || idx >= count) return -1;
+    return idx;
+}
+
+// Bottom-screen touchable group/category list. Same selection-derives-the-
+// page rule as drawLiveTvRows/drawBottomMirrorGrid, but paged over the flat
+// row list (headers included) rather than an item count, since a header can
+// land anywhere in the middle of a page and still needs to take up a row.
+void UI::drawCategoryRows(const std::vector<CategoryRow>& rows, int selectedRow) {
+    if (rows.empty()) {
+        drawText("(no categories)", 8, 100, 0.46f, COL_GREY);
+        return;
+    }
+
+    int page = (selectedRow >= 0 ? selectedRow : 0) / CAT_ROWS_V;
+    int base = page * CAT_ROWS_V;
+
+    for (int i = 0; i < CAT_ROWS_V; i++) {
+        int idx = base + i;
+        if (idx >= (int)rows.size()) break;
+
+        const CategoryRow& row = rows[idx];
+        float y = CAT_ROW_Y0 + i * CAT_ROW_H;
+
+        if (row.isHeader) {
+            drawRect(0, y, BOT_W, CAT_ROW_H - 1, COL_BAR);
+            drawText(row.label, 6, y + 3, 0.38f, COL_YELLOW);
+        } else {
+            bool sel = (idx == selectedRow);
+            drawRect(0, y, BOT_W, CAT_ROW_H - 1,
+                     sel ? COL_SEL : (i % 2 == 0 ? COL_BG_BOT : COL_ROW_ALT));
+            drawTextBuf(row.label, 16, y + 3, 0.40f, COL_WHITE, BOT_W - 22);
+        }
+    }
+
+    int totalPages = ((int)rows.size() + CAT_ROWS_V - 1) / CAT_ROWS_V;
+    if (totalPages > 1) {
+        float barH   = CAT_ROWS_V * CAT_ROW_H;
+        float thumbH = barH / totalPages;
+        float thumbY = CAT_ROW_Y0 + thumbH * page;
+        drawRect(BOT_W - 4, CAT_ROW_Y0, 4, barH,   COL_ROW_ALT);
+        drawRect(BOT_W - 4, thumbY,     4, thumbH, COL_GREY);
+    }
+}
+
+int UI::hitTestCategoryList(const std::vector<CategoryRow>& rows,
+                            int touchX, int touchY, int selectedRow) {
+    int count = (int)rows.size();
+    if (count <= 0) return -1;
+    if (touchX < 0 || touchX >= BOT_W || touchY < CAT_ROW_Y0) return -1;
+    int page = (selectedRow >= 0 ? selectedRow : 0) / CAT_ROWS_V;
+    int base = page * CAT_ROWS_V;
+    int row = (int)((touchY - CAT_ROW_Y0) / CAT_ROW_H);
+    if (row < 0 || row >= CAT_ROWS_V) return -1;
+    int idx = base + row;
+    if (idx < 0 || idx >= count) return -1;
+    if (rows[idx].isHeader) return -1;   // headers aren't selectable
     return idx;
 }
 
@@ -380,6 +438,29 @@ void UI::drawLiveTvGuide(const std::vector<Entry>& channels,
     drawRect(0, 0, BOT_W, BOT_H, COL_BG_BOT);
     drawLiveTvRows(channels, icons, selected);
     drawBottomHints(channels.empty() ? "L/R: Menu" : "A: Watch Live   L/R: Menu");
+}
+
+// Browse Categories (Menu 4): picks one of Tubi's ~70 genres/hubs/
+// collections/networks (see categoryGroups() in catalog.h/.cpp) to fetch its
+// titles on demand -- this is how anime and everything else not featured on
+// the home shelves or already-loaded search results becomes reachable.
+// Selecting a row hands off to main.cpp's existing STATE_ITEMS/drawItemGrid
+// drill-in, same as a series' episode list or a search result page, so this
+// screen only ever needs to draw the picker itself.
+void UI::drawCategoryBrowse(const std::vector<CategoryRow>& rows, int selectedRow) {
+    C2D_SceneBegin(top_);
+    drawTopBar("Browse Categories");
+    drawHomeMenuTabs(TAB_CATEGORIES);
+
+    drawTubiWordmark(TOP_W / 2.0f, 100.0f, 1.6f);
+    drawText("Pick a genre, hub, collection or network below", 46, 150, 0.42f, COL_GREY);
+    drawText("to load everything Tubi has in it -- including", 46, 168, 0.42f, COL_GREY);
+    drawText("things the home shelves and search don't show.", 46, 186, 0.42f, COL_GREY);
+
+    C2D_SceneBegin(bot_);
+    drawRect(0, 0, BOT_W, BOT_H, COL_BG_BOT);
+    drawCategoryRows(rows, selectedRow);
+    drawBottomHints("A: Open   L/R: Menu");
 }
 
 void UI::drawItemGrid(const std::vector<Entry>& items,

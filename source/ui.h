@@ -36,11 +36,33 @@ public:
     static constexpr float LIVE_ROW_H   = 46.0f;
     static constexpr int   LIVE_ROWS_V  = 4;
 
+    // Browse Categories list (bottom screen): a dense text-only row per
+    // group header or category, no icon (unlike LIVE_ROW_* -- there's no
+    // cover art for a category itself, only for the titles inside one,
+    // which reuses drawItemGrid the same way episodes/search results do
+    // once a category is picked).
+    static constexpr float CAT_ROW_Y0   = 26.0f;
+    static constexpr float CAT_ROW_H    = 21.0f;
+    static constexpr int   CAT_ROWS_V   = 9;
+
     // Home-menu L/R tab strip, matching Pluto3DS's layout (TV GUIDE / SHOWS
-    // / MOVIES) rather than 3DSfinPlus's single combined library grid. Tubi
-    // needs no login, so there's nothing to resume and no "Continue
-    // Watching" tab.
-    enum HomeMenuTab { TAB_LIVETV = 0, TAB_SHOWS = 1, TAB_MOVIES = 2 };
+    // / MOVIES) rather than 3DSfinPlus's single combined library grid, plus
+    // a 4th Browse tab (categories/genres/networks) added to reach titles
+    // the home shelves and search never surface. Tubi needs no login, so
+    // there's nothing to resume and no "Continue Watching" tab.
+    enum HomeMenuTab { TAB_LIVETV = 0, TAB_SHOWS = 1, TAB_MOVIES = 2, TAB_CATEGORIES = 3 };
+
+    // One row of the Browse Categories list: either a non-selectable group
+    // title (Hubs/Popular/Genres/Collections/Networks -- cat is null) or a
+    // selectable category (cat points at the entry in categoryGroups() this
+    // row represents). Built once by main.cpp by flattening categoryGroups()
+    // so draw/hit-test here never need to know about groups at all -- they
+    // just walk a flat list and skip headers for selection purposes.
+    struct CategoryRow {
+        bool isHeader;
+        std::string label;
+        const Category* cat = nullptr;
+    };
 
     UI(C3D_RenderTarget* top, C3D_RenderTarget* bot);
     ~UI();
@@ -85,6 +107,19 @@ public:
     // Touch hit-testing for the Live TV guide's channel list (LIVE_ROW_* above).
     static int hitTestLiveList(int touchX, int touchY, int count, int selected);
 
+    // Browse Categories (Menu 4): top screen shows the tab strip plus a
+    // short blurb (there's nothing else to preview until a category is
+    // picked -- selecting one drills into STATE_ITEMS/drawItemGrid, same as
+    // a series' episodes or search results); bottom screen is the touchable
+    // group/category list (CAT_ROW_* above).
+    void drawCategoryBrowse(const std::vector<CategoryRow>& rows, int selectedRow);
+
+    // Touch hit-testing for the Browse Categories list. Returns the absolute
+    // row index under (touchX, touchY), or -1 if the touch isn't over a row
+    // or lands on a non-selectable header row.
+    static int hitTestCategoryList(const std::vector<CategoryRow>& rows,
+                                   int touchX, int touchY, int selectedRow);
+
     // A drilled-into level: a series' episodes, or search results. The
     // touchable grid lives on the bottom screen only, matching drawContentGrid;
     // the top screen shows the level title and the "tubi" wordmark. covers
@@ -119,6 +154,8 @@ private:
     void drawLiveTvRows(const std::vector<Entry>& channels,
                         const std::vector<C2D_Image>& icons,
                         int selected);
+    // Bottom-screen touchable group/category list for Browse Categories (CAT_ROW_* above).
+    void drawCategoryRows(const std::vector<CategoryRow>& rows, int selectedRow);
 
     static std::string formatDuration(double seconds);
     static std::string truncate(const std::string& s, size_t maxLen);

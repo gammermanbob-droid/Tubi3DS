@@ -350,6 +350,109 @@ std::vector<Entry> Catalog::vod() {
     return collectShelves(page, &error);
 }
 
+// ---- Category browser --------------------------------------------------
+// Hand-collected from https://tubitv.com/categories (server-rendered static
+// HTML — unlike vod()/search(), this page does NOT hydrate from window.__data,
+// so there's nothing to scrape here; the list itself has to be maintained by
+// hand). To refresh: fetch that URL and read each section's actual link
+// hrefs (do NOT assume a single path pattern -- confirmed by inspecting the
+// real page that Hubs links are /hubs/<slug>, Networks are /networks/<slug>,
+// and everything else is /category/<slug>; several slugs also don't match
+// their display name at all, e.g. Classic TV & Movies -> "classics",
+// Indie Movies -> "indie_films", The YA Edit -> "ya_forever"). The grouping
+// below (Hubs/Popular/Genres/Collections/Networks) mirrors the page's own
+// section headings as of this writing.
+const std::vector<CategoryGroup>& categoryGroups() {
+    static const std::vector<CategoryGroup> groups = {
+        { "Hubs", {
+            {"Creatorverse","creatorverse-hub","hubs"},
+            {"Terror on Tubi","terror-on-tubi-hub","hubs"},
+        }},
+        { "Popular", {
+            {"Black Storytelling","black_cinema","category"},
+            {"Most Popular","most_popular","category"},
+            {"Recently Added","recently_added","category"},
+            {"Recommended","recommended_for_you","category"},
+            {"Tubi Originals","tubi_originals","category"},
+        }},
+        { "Genres", {
+            {"Action","action","category"},
+            {"Adult Animation","adult_animation","category"},
+            {"Anime","anime","category"},
+            {"Classic TV & Movies","classics","category"},
+            {"Comedy","comedy","category"},
+            {"Crime TV","crime_tv","category"},
+            {"Documentaries","documentary","category"},
+            {"Docuseries","docuseries","category"},
+            {"Drama","drama","category"},
+            {"Family Movies","family_movies","category"},
+            {"Family Shows","family_series","category"},
+            {"Horror","horror","category"},
+            {"Indie Movies","indie_films","category"},
+            {"LGBTQ+ Storytelling","lgbt","category"},
+            {"Lifestyle","lifestyle_tv","category"},
+            {"Music","music","category"},
+            {"Mystery","mystery","category"},
+            {"Podcasts","podcast","category"},
+            {"Reality TV","reality_tv","category"},
+            {"Romance","romance","category"},
+            {"Sci-fi & Fantasy","sci_fi_and_fantasy","category"},
+            {"Science & Nature","science_and_nature_acc","category"},
+            {"Sports Stories","sports_movies_and_tv","category"},
+            {"Thrillers","thrillers","category"},
+            {"True Crime","true_crime","category"},
+            {"Westerns","westerns","category"},
+        }},
+        { "Collections", {
+            {"Audio Description","audio_description","category"},
+            {"Back To School","back_to_school","category"},
+            {"Double Features","double_features","category"},
+            {"Family Franchise Faves","family_franchises","category"},
+            {"Franchise Fever","franchise_fever","category"},
+            {"K-Horror Nightmares","korean_horror","category"},
+            {"Martin Scorsese Essentials","martin_scorsese","category"},
+            {"Spy Movies","spy_movies","category"},
+            {"Superheroes","superheroes","category"},
+            {"The YA Edit","ya_forever","category"},
+            {"Transformers Universe","transformers_universe","category"},
+            {"Trophy-Worthy TV","trophy_worthy_tv","category"},
+            {"Witch, Please","witch_please","category"},
+        }},
+        { "Networks", {
+            {"A&E","aetv","networks"},
+            {"A24","a24","networks"},
+            {"CJ ENM Selects","cj_enm","networks"},
+            {"Classic Doctor Who","classic_doctor_who","networks"},
+            {"CONtv","contv","networks"},
+            {"Docurama","docurama","networks"},
+            {"Dove Channel","dovechannel","networks"},
+            {"DUST","dust","networks"},
+            {"FilmRise","filmriseclassictv","networks"},
+            {"FOX","fox","networks"},
+            {"FOX SOUL","fox_soul","networks"},
+            {"FOX Sports","fox_sports","networks"},
+            {"Full Moon Features","full_moon_features","networks"},
+            {"Hallmark","hallmark","networks"},
+            {"Lifetime","lifetime","networks"},
+            {"LOL! Network","lol_network","networks"},
+            {"Sesame Street","sesame_workshop","networks"},
+            {"Shout! Factory TV","shoutfactorytv","networks"},
+            {"So...Real","so_real","networks"},
+            {"TMZ Presents","tmz","networks"},
+            {"TV One","tvone","networks"},
+            {"UNINTERRUPTED","uninterrupted","networks"},
+        }},
+    };
+    return groups;
+}
+
+std::vector<Entry> Catalog::category(const Category& cat) {
+    error.clear();
+    auto page = scrapePageData("https://tubitv.com/"+cat.pathPrefix+"/"+cat.slug);
+    if (!error.empty()) return {};
+    return collectShelves(page, &error);
+}
+
 // No discoverable server-side search endpoint (see the comment above
 // scrapePageData): this filters titles already visible across the home
 // page's shelves rather than searching Tubi's full catalog. It will miss

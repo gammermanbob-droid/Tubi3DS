@@ -31,11 +31,16 @@ enum PendingLoad {
     LOAD_LIVETV,    // Catalog::channels() + icon art
     LOAD_SEARCH,    // Catalog::search(query), pushed as an item level
     LOAD_EPISODES,  // Catalog::episodes(series), pushed as an item level
+    LOAD_CATEGORY,  // Catalog::category(pendingCategory), pushed as an item level
 };
 
-// The three home-level menus, cycled with L/R -- same layout and order as
-// Pluto3DS's TV GUIDE / SHOWS / MOVIES tabs.
-enum HomeMenu { HOME_LIVETV = 0, HOME_SHOWS = 1, HOME_MOVIES = 2 };
+// The four home-level menus, cycled with L/R -- same layout and order as
+// Pluto3DS's TV GUIDE / SHOWS / MOVIES tabs, plus a 4th Browse Categories
+// menu (categoryGroups() in catalog.h) reaching Tubi's full genre/hub/
+// collection/network list -- vod()'s home shelves and search() (which only
+// searches what vod() already loaded) never surface everything Tubi has
+// (e.g. anime, which isn't on the homepage but does have its own genre).
+enum HomeMenu { HOME_LIVETV = 0, HOME_SHOWS = 1, HOME_MOVIES = 2, HOME_CATEGORIES = 3 };
 
 // ---- Globals ---------------------------------------------------------------
 
@@ -99,6 +104,31 @@ static std::vector<ItemLevel> browseStack;
 
 static std::string searchQuery;
 static Entry        drillSeries; // series Entry to fetch episodes() for
+
+// Browse Categories (Menu 4). categoryRows is a flat list built once at
+// startup from catalog.h's static categoryGroups() -- see buildCategoryRows()
+// -- mixing non-selectable group-header rows with selectable category rows
+// so UI::drawCategoryRows/hitTestCategoryList never need to know about
+// groups at all. Each selectable row's `cat` points into categoryGroups()'s
+// own storage (a function-local static, alive for the program's lifetime),
+// so it's never invalidated. Picking one fetches its titles into a fresh
+// ItemLevel (LOAD_CATEGORY, mirroring LOAD_EPISODES) -- no cover art, same
+// as episodes()/search().
+static std::vector<UI::CategoryRow> categoryRows;
+static int      selCategoryRow = -1;
+static Category pendingCategory;
+
+static void buildCategoryRows() {
+    categoryRows.clear();
+    for (const auto& g : categoryGroups()) {
+        categoryRows.push_back({true, g.title, nullptr});
+        for (const auto& c : g.items) categoryRows.push_back({false, c.name, &c});
+    }
+    selCategoryRow = 0;
+    while (selCategoryRow < (int)categoryRows.size() && categoryRows[selCategoryRow].isHeader)
+        selCategoryRow++;
+    if (selCategoryRow >= (int)categoryRows.size()) selCategoryRow = -1;
+}
 
 // ---- Cover-art helpers (Live TV guide only) ---------------------------------
 
@@ -297,6 +327,7 @@ int main() {
 
     if (!graphicsStart()) { gfxExit(); return 1; }
     ui = new UI(topScreen, botScreen);
+    buildCategoryRows();
 
     if (!newModel) {
         errorMsg = "New 3DS / New 2DS XL required";
@@ -378,6 +409,15 @@ int main() {
                     break;
                 }
 
+                case LOAD_CATEGORY: {
+                    ItemLevel lv;
+                    lv.title = pendingCategory.name;
+                    lv.items = catalog.category(pendingCategory);
+                    browseStack.push_back(std::move(lv));
+                    state = STATE_ITEMS;
+                    break;
+                }
+
                 default: break;
             }
             pending = LOAD_NONE;
@@ -391,12 +431,16 @@ int main() {
                 break;
 
             case STATE_HOME: {
-                // L/R cycle the three home menus.
+                // L/R cycle the four home menus. HOME_CATEGORIES needs no
+                // network fetch to show its picker (categoryRows is static
+                // data built once at startup) -- only actually picking a
+                // category triggers a load (LOAD_CATEGORY, below), same as
+                // how picking a series triggers LOAD_EPISODES.
                 if (kDown & (KEY_L | KEY_R)) {
-                    int dir = (kDown & KEY_R) ? 1 : 2; // +1 or -1 (mod 3)
-                    homeMenu = (HomeMenu)(((int)homeMenu + dir) % 3);
+                    int dir = (kDown & KEY_R) ? 1 : -1;
+                    homeMenu = (HomeMenu)(((int)homeMenu + dir + 4) % 4);
                     if (homeMenu == HOME_LIVETV && !liveLoaded) requestLoad(homeMenu);
-                    else if (homeMenu != HOME_LIVETV && !vodLoaded) requestLoad(homeMenu);
+                    else if ((homeMenu == HOME_SHOWS || homeMenu == HOME_MOVIES) && !vodLoaded) requestLoad(homeMenu);
                     break;
                 }
 
@@ -428,6 +472,9 @@ int main() {
                     } else if (curList) {
                         touchHit = UI::hitTestBottomGrid(touch.px, touch.py,
                                                           (int)curList->size(), *curSel);
+                    } else if (homeMenu == HOME_CATEGORIES) {
+                        touchHit = UI::hitTestCategoryList(categoryRows, touch.px, touch.py,
+                                                            selCategoryRow);
                     } else {
                         touchHit = UI::hitTestLiveList(touch.px, touch.py,
                                                         (int)liveChannels.size(), selLive);
@@ -473,6 +520,28 @@ int main() {
                         } else {
                             playEntry(e);
                         }
+                    }
+                } else if (homeMenu == HOME_CATEGORIES) {
+                    int n = (int)categoryRows.size();
+                    if (touchHit >= 0) selCategoryRow = touchHit;
+                    // Up/Down skip header rows entirely -- selCategoryRow
+                    // should only ever land on a selectable (non-header) row.
+                    if (kDown & KEY_DOWN) {
+                        int next = selCategoryRow + 1;
+                        while (next < n && categoryRows[next].isHeader) next++;
+                        if (next < n) selCategoryRow = next;
+                    }
+                    if (kDown & KEY_UP) {
+                        int prev = selCategoryRow - 1;
+                        while (prev >= 0 && categoryRows[prev].isHeader) prev--;
+                        if (prev >= 0) selCategoryRow = prev;
+                    }
+                    if (kDown & KEY_A && selCategoryRow >= 0 && selCategoryRow < n &&
+                        !categoryRows[selCategoryRow].isHeader && categoryRows[selCategoryRow].cat) {
+                        pendingCategory = *categoryRows[selCategoryRow].cat;
+                        loadMsg = "Loading \"" + pendingCategory.name + "\"...";
+                        pending = LOAD_CATEGORY;
+                        state   = STATE_LOADING;
                     }
                 } else { // HOME_LIVETV
                     int n = (int)liveChannels.size();
@@ -548,10 +617,12 @@ int main() {
                     std::string title = "Shows";
                     if (selShowGenre > 0) title += " - " + showsGenres[selShowGenre];
                     ui->drawContentGrid(showsFiltered, {}, selShows, UI::TAB_SHOWS, title);
-                } else {
+                } else if (homeMenu == HOME_MOVIES) {
                     std::string title = "Movies";
                     if (selMovieGenre > 0) title += " - " + moviesGenres[selMovieGenre];
                     ui->drawContentGrid(moviesFiltered, {}, selMovies, UI::TAB_MOVIES, title);
+                } else {
+                    ui->drawCategoryBrowse(categoryRows, selCategoryRow);
                 }
                 break;
 

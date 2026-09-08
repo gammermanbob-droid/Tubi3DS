@@ -22,6 +22,32 @@ struct Playback {
     double duration=0;
 };
 
+// One entry in Tubi's category browser. name is what's shown in the picker;
+// slug is the URL path segment; pathPrefix is which section of the site it
+// lives under -- confirmed these differ per group (Genres/Popular/
+// Collections: "category"; Networks: "networks"; Hubs: "hubs", NOT
+// "category" despite otherwise looking like one) by fetching
+// https://tubitv.com/categories and reading each link's actual href rather
+// than assuming a single pattern.
+struct Category {
+    std::string name, slug, pathPrefix;
+};
+
+// A titled group of categories, purely for how the picker displays them
+// (Hubs/Popular/Genres/Collections/Networks) -- Tubi itself has no API for
+// this list, so both the grouping and the slugs below are hand-collected
+// from https://tubitv.com/categories (see categoryGroups() in catalog.cpp).
+struct CategoryGroup {
+    std::string title;
+    std::vector<Category> items;
+};
+
+// The full, hand-collected category list shown by the Browse Categories
+// screen, grouped for display. Static data (not fetched -- Tubi's category
+// list itself isn't exposed anywhere machine-readable); see catalog.cpp for
+// the source and how to refresh it if Tubi adds/renames categories later.
+const std::vector<CategoryGroup>& categoryGroups();
+
 // Tubi needs no session/login for any of this — every endpoint below is the
 // same unauthenticated request Tubi's own website makes. That also means,
 // unlike Pluto3DS's Catalog, there is no boot()/token/expires bookkeeping.
@@ -61,6 +87,16 @@ public:
     // A series' episodes, flattened across all seasons in order.
     // Best-effort, same caveat as vod().
     std::vector<Entry> episodes(const Entry& series);
+
+    // A single category/network/hub's titles (e.g. Anime, Sci-fi & Fantasy,
+    // A24) -- lets Browse Categories reach titles vod()'s homepage shelves
+    // and search() (which only searches what vod() already loaded) never
+    // surface. Same scrapePageData()+collectShelves() approach as vod(),
+    // just pointed at tubitv.com/<cat.pathPrefix>/<cat.slug> — confirmed
+    // that page's containerChildrenIdMap is populated the same way even
+    // though its containersList (home-page shelf ordering only) is empty
+    // there. Same best-effort/empty-list-on-miss caveat as vod().
+    std::vector<Entry> category(const Category& cat);
 
     // Resolves a playable Entry to an actual HLS URL. For a channel this is
     // just hls::parse()+variant-select on Entry::url. For a movie/episode
