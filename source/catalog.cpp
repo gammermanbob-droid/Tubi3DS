@@ -5,7 +5,57 @@
 #include <set>
 #include <cctype>
 #include <cstdio>
+#include <cstdarg>
 #include <ctime>
+
+// ---- Live-channel diagnostics ----------------------------------------------
+// Three prior fixes (skip the fMP4 probe for live playback, cycle the ABR
+// ladder on renewal instead of re-picking the same rung, and normalize/
+// DRM-filter the channel manifest URL like the reference scraper does) each
+// looked like a plausible cause of a live-channel HTTP 404 loop, and none of
+// them changed the symptom -- confirmed identical across two entirely
+// different channels (NASCAR, then UEFA TV), so this isn't one channel's
+// broken rendition or one channel's DRM-ordered resource list. Rather than
+// guess a fifth fix blindly, this appends ground truth to a dedicated
+// catalog_debug.txt (kept separate from playerPlay's player_debug.txt, which
+// is opened in truncating "w" mode well after Catalog::resolve() already
+// ran): every channel's video_resources types as channels() sees them, and
+// -- for whichever channel actually gets played -- the exact master
+// playlist URL used and a redacted dump of what Tubi's origin actually sent
+// back for it. That settles, directly, whether the master response itself
+// is legitimate live content or something generic/wrong, instead of
+// continuing to infer it indirectly from which derived rendition 404s.
+static void appendDebug(const char* fmt, ...) {
+    FILE* f = fopen("sdmc:/3ds/pluto3ds/catalog_debug.txt", "a");
+    if (!f) return;
+    va_list args; va_start(args, fmt);
+    vfprintf(f, fmt, args);
+    va_end(args);
+    fclose(f);
+}
+// Redacts every line's query string (same "?<redacted>" convention used
+// throughout this codebase) so a raw playlist-body dump can be pasted back
+// without leaking signed tokens.
+static std::string redactLines(const std::string& text, size_t maxBytes) {
+    std::string src = text.size() > maxBytes ? text.substr(0, maxBytes) : text;
+    std::string out;
+    size_t start = 0;
+    while (start <= src.size()) {
+        size_t nl = src.find('\n', start);
+        std::string line = src.substr(start, nl == std::string::npos ? std::string::npos : nl - start);
+        size_t q = line.find('?');
+        out += (q == std::string::npos ? line : line.substr(0, q) + "?<redacted>");
+        out += '\n';
+        if (nl == std::string::npos) break;
+        start = nl + 1;
+    }
+    if (text.size() > maxBytes) out += "...(truncated)\n";
+    return out;
+}
+static std::string redactUrl(const std::string& url) {
+    size_t q = url.find('?');
+    return q == std::string::npos ? url : url.substr(0, q) + "?<redacted>";
+}
 
 // ---- picojson helpers (same defensive pattern Pluto3DS's catalog.cpp uses:
 // every accessor tolerates a missing/wrong-typed key instead of throwing) ---
@@ -216,6 +266,24 @@ std::vector<Entry> Catalog::channels() {
             // and prefer hlsv3/hlsv6 -- reusing it here instead of
             // duplicating a naive version fixes channels() the same way.
             e.url = pickManifestUrl(row);
+            // Diagnostic (see the block comment near appendDebug/redactUrl
+            // above): dump every channel's video_resources types and which
+            // one got picked, once per channels() call (guide load), so we
+            // can see directly whether DRM/DASH entries are actually
+            // present/ordered the way the 404-loop investigation suspected
+            // -- across the whole channel list, not just whichever one gets
+            // played.
+            {
+                std::string types;
+                for (const auto& res : arrayField(row,"video_resources")) {
+                    if (!types.empty()) types += ",";
+                    std::string t = str(res,"type");
+                    types += t.empty() ? "(none)" : t;
+                }
+                appendDebug("channel id=%s title=%s resources=[%s] picked=%s\n",
+                            e.id.c_str(), e.title.c_str(), types.c_str(),
+                            redactUrl(e.url).c_str());
+            }
             for (const auto& prog : arrayField(row,"programs")) {
                 auto start=str(prog,"start_time"), stop=str(prog,"end_time");
                 if (start<=nowIso && stop>nowIso) e.now=str(prog,"title");
@@ -398,6 +466,20 @@ Playback Catalog::resolve(const Entry& e, int variantAttempt) {
     if (manifestUrl.empty()) { p.error="No stream available for this title"; return p; }
 
     auto r = get(manifestUrl);
+    // Diagnostic (see the block comment near appendDebug above): for
+    // whichever channel is actually being played (e.url was non-empty going
+    // in -- VOD's manifestUrl only ever comes from pickManifestUrl() inside
+    // this function, never from the Entry itself), log exactly what was
+    // fetched and what came back, redacted. This directly answers whether
+    // Tubi's origin is serving genuine live master content for this URL or
+    // something else, instead of continuing to infer it from which derived
+    // rendition 404s three layers downstream.
+    if (!e.url.empty()) {
+        appendDebug("\nresolve channel id=%s title=%s attempt=%d masterUrl=%s httpStatus=%lu error=%08lX bodyBytes=%lu\n",
+                    e.id.c_str(), e.title.c_str(), variantAttempt, redactUrl(manifestUrl).c_str(),
+                    (unsigned long)r.status, (unsigned long)r.error, (unsigned long)r.body.size());
+        appendDebug("masterBody(first 1000B, redacted):\n%s\n", redactLines(r.body, 1000).c_str());
+    }
     if (!r.ok()) { p.error="Playback unavailable ("+std::to_string(r.status)+")"; return p; }
     auto master = hls::parse(r.body);
 
