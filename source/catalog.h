@@ -103,6 +103,11 @@ public:
     // (which normally arrives with url empty), it first fetches the title's
     // own page to read its video_resources — the same window.__data lookup
     // yt-dlp's Tubi extractor uses — before doing the same variant-select.
+    // Variant-select also drops any rendition whose CODECS attribute names
+    // an HEVC profile (hev1/hvc1/dvhe/dvh1) before picking one: New3DS's MVD
+    // hardware decoder only understands H.264, and some Tubi titles (whole
+    // categories, even — Anime among them) are HEVC-only. p.error is set
+    // instead of returning an HEVC URL when a title has nothing else.
     //
     // variantAttempt selects which rung of the ABR ladder to use, sorted
     // ascending by bandwidth and taken modulo the variant count: 0 (the

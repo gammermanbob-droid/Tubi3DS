@@ -534,6 +534,44 @@ static std::string pickManifestUrl(const picojson::value& videoObj) {
     return "";
 }
 
+// Tubi can offer an HEVC-coded rendition for a title (typically alongside,
+// or instead of, an H.264 one for a 4K/HDR master) via the exact same
+// video_resources/hlsv6 path pickManifestUrl() already prefers second --
+// "hlsv6" itself says nothing about codec, only container/packaging, so
+// this can't be filtered any earlier than here, where the actual master
+// playlist's own #EXT-X-STREAM-INF CODECS attribute (already parsed into
+// hls::Variant::codecs by hls::parse()) is the only thing that says what's
+// really inside a given rendition. New3DS's MVD hardware decoder only
+// understands H.264 (see player.cpp's mvdstdInit(..., MVD_INPUT_H264, ...))
+// -- there is no HEVC decode path on this hardware, hardware or software
+// (an ARM11 CPU has nowhere near the throughput for software HEVC decode at
+// any watchable resolution), so an HEVC rendition has to be skipped in favor
+// of an H.264 one whenever a master offers both, and the whole title
+// reported as unplayable (not silently handed to MVD, which expects H.264
+// NAL unit framing and would misparse HEVC's differently-shaped NAL headers
+// rather than failing cleanly) when every rendition in it is HEVC.
+static bool isHevcCodec(const std::string& codecs) {
+    // CODECS is a comma-separated list per RFC 6381 (e.g. one video + one
+    // audio entry); check each entry's own prefix rather than the whole
+    // attribute string, and case-insensitively since the RFC's example
+    // casing ("hev1", "hvc1") isn't binding on how any given origin emits it.
+    size_t start = 0;
+    while (start <= codecs.size()) {
+        size_t comma = codecs.find(',', start);
+        std::string one = codecs.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+        std::string lower; lower.reserve(one.size());
+        for (char c : one) lower += (char)tolower((unsigned char)c);
+        // hev1/hvc1: plain HEVC. dvhe/dvh1: Dolby Vision profiles that are
+        // HEVC-based (dual-layer or single-layer over HEVC) -- MVD can't
+        // decode the HEVC base layer any more than a plain hev1/hvc1 one.
+        if (lower.rfind("hev1",0)==0 || lower.rfind("hvc1",0)==0 ||
+            lower.rfind("dvhe",0)==0 || lower.rfind("dvh1",0)==0) return true;
+        if (comma == std::string::npos) break;
+        start = comma + 1;
+    }
+    return false;
+}
+
 Playback Catalog::resolve(const Entry& e, int variantAttempt) {
     error.clear();
     Playback p;
@@ -569,23 +607,43 @@ Playback Catalog::resolve(const Entry& e, int variantAttempt) {
     if (manifestUrl.empty()) { p.error="No stream available for this title"; return p; }
 
     auto r = get(manifestUrl);
-    // Diagnostic (see the block comment near appendDebug above): for
-    // whichever channel is actually being played (e.url was non-empty going
-    // in -- VOD's manifestUrl only ever comes from pickManifestUrl() inside
-    // this function, never from the Entry itself), log exactly what was
-    // fetched and what came back, redacted. This directly answers whether
-    // Tubi's origin is serving genuine live master content for this URL or
+    // Diagnostic (see the block comment near appendDebug above): log exactly
+    // what was fetched and what came back, redacted, for every resolve --
+    // channel or VOD/episode alike (this used to be channel-only, gated on
+    // `!e.url.empty()`, which meant a movie/episode's own master fetch was
+    // never logged at all; there was no way to see what Tubi actually sent
+    // back for one short of adding this by hand). This directly answers
+    // whether Tubi's origin is serving genuine content for this URL or
     // something else, instead of continuing to infer it from which derived
-    // rendition 404s three layers downstream.
-    if (!e.url.empty()) {
-        appendDebug("\nresolve channel id=%s title=%s attempt=%d masterUrl=%s finalUrl=%s httpStatus=%lu error=%08lX bodyBytes=%lu\n",
-                    e.id.c_str(), e.title.c_str(), variantAttempt, redactUrl(manifestUrl).c_str(),
-                    redactUrl(r.finalUrl).c_str(),
-                    (unsigned long)r.status, (unsigned long)r.error, (unsigned long)r.body.size());
-        appendDebug("masterBody(first 1000B, redacted):\n%s\n", redactLines(r.body, 1000).c_str());
-    }
+    // rendition fails three layers downstream.
+    appendDebug("\nresolve id=%s title=%s kind=%s attempt=%d masterUrl=%s finalUrl=%s httpStatus=%lu error=%08lX bodyBytes=%lu\n",
+                e.id.c_str(), e.title.c_str(), e.kind.c_str(), variantAttempt, redactUrl(manifestUrl).c_str(),
+                redactUrl(r.finalUrl).c_str(),
+                (unsigned long)r.status, (unsigned long)r.error, (unsigned long)r.body.size());
+    appendDebug("masterBody(first 1000B, redacted):\n%s\n", redactLines(r.body, 1000).c_str());
     if (!r.ok()) { p.error="Playback unavailable ("+std::to_string(r.status)+")"; return p; }
     auto master = hls::parse(r.body);
+    // Log what hls::parse() actually found, unconditionally -- most
+    // importantly master.subtitles, which nothing in this function has ever
+    // looked at before now (Playback::subtitleVtt/subtitleDebug exist and
+    // are threaded all the way through to player.cpp, but resolve() never
+    // populated them). Logging this even in the empty case is deliberate: a
+    // log with no subtitle-related lines was previously ambiguous between
+    // "Tubi's master genuinely has no subtitle renditions" and "the code
+    // just never checked" -- it was always the latter, since this parses
+    // and inspects master.subtitles regardless.
+    appendDebug("parsed: variants=%zu segments=%zu fragmented=%d audio=%zu subtitles=%zu\n",
+                master.variants.size(), master.segments.size(), (int)master.fragmented,
+                master.audio.size(), master.subtitles.size());
+    if (master.subtitles.empty()) {
+        appendDebug("  no subtitle renditions in master playlist\n");
+    } else {
+        for (const auto& s : master.subtitles) {
+            appendDebug("  subtitle group=%s lang=%s default=%d forced=%d uri=%s\n",
+                        s.groupId.c_str(), s.language.c_str(), (int)s.isDefault, (int)s.isForced,
+                        redactUrl(s.uri).c_str());
+        }
+    }
 
     // get()/fetch() follows redirects internally and r.body is whatever the
     // LAST hop actually returned, but a variant URI inside that body which
@@ -606,12 +664,35 @@ Playback Catalog::resolve(const Entry& e, int variantAttempt) {
 
     std::string finalUrl;
     if (!master.variants.empty()) {
+        // Drop any variant whose CODECS attribute explicitly names an HEVC
+        // profile (see isHevcCodec() above) -- but only if that still leaves
+        // at least one variant, since a master with no CODECS attribute at
+        // all (some origins omit it) must not be treated as if every
+        // variant were HEVC just because none could be positively confirmed
+        // H.264 either. If every variant is confirmed HEVC, this whole
+        // title has nothing this hardware can decode.
+        std::vector<hls::Variant> nonHevc;
+        for (const auto& v : master.variants) if (!isHevcCodec(v.codecs)) nonHevc.push_back(v);
+        if (nonHevc.size() != master.variants.size()) {
+            std::string allCodecs;
+            for (const auto& v : master.variants) { allCodecs += v.codecs; allCodecs += ' '; }
+            if (nonHevc.empty()) {
+                appendDebug("ERROR: No H.264 variants found, codecs available: %s\n", allCodecs.c_str());
+            } else {
+                appendDebug("Filtered to %zu H.264 variant(s) from %zu total (codecs seen: %s)\n",
+                            nonHevc.size(), master.variants.size(), allCodecs.c_str());
+            }
+        }
+        if (nonHevc.empty()) {
+            p.error = "This title is only available in HEVC, which the 3DS's video decoder can't play.";
+            return p;
+        }
         // Sorted ascending by bandwidth so attempt 0 keeps the original
         // lowest-bitrate choice; a nonzero variantAttempt (renewal retries
         // only -- see the header comment) steps to the next rung up instead
         // of landing back on the same one, and wraps rather than picking
         // something out of range.
-        std::vector<hls::Variant> byBandwidth(master.variants.begin(), master.variants.end());
+        std::vector<hls::Variant> byBandwidth(nonHevc.begin(), nonHevc.end());
         std::sort(byBandwidth.begin(), byBandwidth.end(),
                   [](const hls::Variant& a,const hls::Variant& b){return a.bandwidth<b.bandwidth;});
         size_t idx = byBandwidth.size() > 1
@@ -619,6 +700,8 @@ Playback Catalog::resolve(const Entry& e, int variantAttempt) {
                    : 0;
         const auto& v = byBandwidth[idx];
         finalUrl = hls::resolve(masterBaseUrl, v.uri);
+        appendDebug("picked variant idx=%zu bandwidth=%u codecs=%s finalUrl=%s\n",
+                    idx, v.bandwidth, v.codecs.c_str(), redactUrl(finalUrl).c_str());
         if (!v.audio.empty()) {
             std::string best;
             for (const auto& a : master.audio) {
