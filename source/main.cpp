@@ -4,6 +4,8 @@
 #include <vector>
 #include <cstdio>
 #include <cstdlib>
+#include <sys/stat.h>
+#include <algorithm>
 #include "catalog.h"
 #include "http.h"
 #include "image.h"
@@ -63,6 +65,17 @@ static int  selShows  = 0;
 static int  selMovies = 0;
 static bool vodLoaded = false;
 
+// Genre/category filter, one per tab, matching Pluto3DS's "All genres" +
+// unique-genres-seen list. showsFiltered/moviesFiltered are what's actually
+// browsed and drawn; they're rebuilt from the full entries list whenever the
+// genre selection changes (see rebuildGenreFilter()), not every frame.
+static std::vector<std::string> showsGenres  = {"All genres"};
+static std::vector<std::string> moviesGenres = {"All genres"};
+static int selShowGenre  = 0;
+static int selMovieGenre = 0;
+static std::vector<Entry> showsFiltered;
+static std::vector<Entry> moviesFiltered;
+
 // Live TV guide (Menu 1). Fetched once per session (lazily, the first time
 // the user switches into the menu) -- the only screen with real cover art.
 static std::vector<Entry>       liveChannels;
@@ -116,6 +129,35 @@ static void fetchCoverData(std::vector<std::string>& coverData,
 static void fetchLiveCovers() {
     fetchCoverData(liveCoverData, liveChannels);
     buildCoverTextures(liveCovers, liveCoverData, liveChannels.size());
+}
+
+// ---- Genre/category filter (Shows/Movies tabs) ------------------------------
+
+static std::vector<std::string> collectGenres(const std::vector<Entry>& entries) {
+    std::vector<std::string> g = {"All genres"};
+    for (const auto& e : entries)
+        if (!e.genre.empty() && std::find(g.begin(), g.end(), e.genre) == g.end())
+            g.push_back(e.genre);
+    return g;
+}
+static std::vector<Entry> filterByGenre(const std::vector<Entry>& entries,
+                                        const std::vector<std::string>& genres,
+                                        int idx) {
+    if (idx <= 0 || idx >= (int)genres.size()) return entries; // 0 = "All genres"
+    std::vector<Entry> out;
+    for (const auto& e : entries) if (e.genre == genres[idx]) out.push_back(e);
+    return out;
+}
+// Recomputes *Filtered from the full entries list for the given tab and
+// resets its selection, matching Pluto3DS's changeGenre()/filter() reset.
+static void rebuildGenreFilter(HomeMenu m) {
+    if (m == HOME_SHOWS) {
+        showsFiltered = filterByGenre(showsEntries, showsGenres, selShowGenre);
+        selShows = 0;
+    } else if (m == HOME_MOVIES) {
+        moviesFiltered = filterByGenre(moviesEntries, moviesGenres, selMovieGenre);
+        selMovies = 0;
+    }
 }
 
 // ---- Graphics start/stop (also used around playback) -----------------------
@@ -188,12 +230,13 @@ static void playEntry(const Entry& e) {
     }
 
     double offset = 0, seek = -1;
+    bool ok = true;
     do {
         seek = -1;
-        playerPlay(data.url, (long long)(data.duration * 10000000.0),
-                   "Tubi3DS", e.title, 0, offset, &seek,
-                   data.subtitleVtt, nullptr, "", false,
-                   data.audioUrl, data.subtitleDebug);
+        ok = playerPlay(data.url, (long long)(data.duration * 10000000.0),
+                        "Tubi3DS", e.title, 0, offset, &seek,
+                        data.subtitleVtt, nullptr, "", false,
+                        data.audioUrl, data.subtitleDebug);
         if (seek >= 0) offset = seek;
     } while (seek >= 0);
 
@@ -206,6 +249,15 @@ static void playEntry(const Entry& e) {
     }
     ui = new UI(topScreen, botScreen);
     if (liveLoaded) buildCoverTextures(liveCovers, liveCoverData, liveChannels.size());
+
+    // playerPlay() returns false on MVD init/allocation failure (Old 3DS, or
+    // out of memory) rather than actually playing anything; surface that
+    // instead of silently landing back on the grid with no explanation.
+    if (!ok) {
+        errorMsg = "Playback failed to start for \"" + e.title +
+                   "\".\n\nCheck sdmc:/3ds/pluto3ds/player_debug.txt for details.";
+        state = STATE_ERROR;
+    }
 }
 
 // ---- Software keyboard helper -----------------------------------------------
@@ -223,6 +275,14 @@ static std::string swkbdRead(const char* hint) {
 
 int main() {
     gfxInitDefault();
+    // player.cpp (copied unchanged from Pluto3DS) hardcodes its debug log
+    // path to sdmc:/3ds/pluto3ds/player_debug.txt -- fopen() there silently
+    // fails (and playback just runs without a log) unless that directory
+    // already exists, which it only would if Pluto3DS was also ever
+    // installed on this SD card. Create it here so the log is always
+    // available for diagnosing a failed/frozen playback attempt.
+    mkdir("sdmc:/3ds", 0777);
+    mkdir("sdmc:/3ds/pluto3ds", 0777);
     Result httpRes = httpcInit(4 * 1024 * 1024);
 
     bool newModel = false;
@@ -269,6 +329,12 @@ int main() {
                         if (e.kind == "series")      showsEntries.push_back(std::move(e));
                         else if (e.kind == "movie")  moviesEntries.push_back(std::move(e));
                     }
+                    showsGenres  = collectGenres(showsEntries);
+                    moviesGenres = collectGenres(moviesEntries);
+                    selShowGenre = 0;
+                    selMovieGenre = 0;
+                    showsFiltered  = showsEntries;
+                    moviesFiltered = moviesEntries;
                     selShows = 0;
                     selMovies = 0;
                     vodLoaded = true;
@@ -335,12 +401,22 @@ int main() {
                 bool touching = (hidKeysHeld() & KEY_TOUCH) != 0;
                 int  touchHit = -1;
                 bool touchSearch = false;
-                std::vector<Entry>* curList = (homeMenu == HOME_SHOWS) ? &showsEntries
-                                             : (homeMenu == HOME_MOVIES) ? &moviesEntries
+                // Grid nav/selection/touch all operate on the genre-filtered
+                // list (see rebuildGenreFilter()); the unfiltered
+                // showsEntries/moviesEntries only feed the genre list itself
+                // and get re-filtered when it changes.
+                std::vector<Entry>* curList = (homeMenu == HOME_SHOWS) ? &showsFiltered
+                                             : (homeMenu == HOME_MOVIES) ? &moviesFiltered
                                              : nullptr;
                 int* curSel = (homeMenu == HOME_SHOWS) ? &selShows
                             : (homeMenu == HOME_MOVIES) ? &selMovies
                             : nullptr;
+                std::vector<std::string>* curGenres = (homeMenu == HOME_SHOWS) ? &showsGenres
+                                                     : (homeMenu == HOME_MOVIES) ? &moviesGenres
+                                                     : nullptr;
+                int* curGenreIdx = (homeMenu == HOME_SHOWS) ? &selShowGenre
+                                 : (homeMenu == HOME_MOVIES) ? &selMovieGenre
+                                 : nullptr;
                 if (touching && !homeTouchWasHeld) {
                     touchPosition touch; hidTouchRead(&touch);
                     if (curList && touch.px >= UI::BOT_W - 72 && touch.py < 24) {
@@ -364,6 +440,14 @@ int main() {
                             pending = LOAD_SEARCH;
                             state   = STATE_LOADING;
                         }
+                        break;
+                    }
+
+                    if (kDown & (KEY_X | KEY_SELECT)) {
+                        int gd = (kDown & KEY_X) ? 1 : -1;
+                        int gn = (int)curGenres->size();
+                        *curGenreIdx = (*curGenreIdx + gd + gn) % gn;
+                        rebuildGenreFilter(homeMenu);
                         break;
                     }
 
@@ -454,12 +538,17 @@ int main() {
                 break;
 
             case STATE_HOME:
-                if (homeMenu == HOME_LIVETV)
+                if (homeMenu == HOME_LIVETV) {
                     ui->drawLiveTvGuide(liveChannels, liveCovers, selLive);
-                else if (homeMenu == HOME_SHOWS)
-                    ui->drawContentGrid(showsEntries, {}, selShows, UI::TAB_SHOWS, "Shows");
-                else
-                    ui->drawContentGrid(moviesEntries, {}, selMovies, UI::TAB_MOVIES, "Movies");
+                } else if (homeMenu == HOME_SHOWS) {
+                    std::string title = "Shows";
+                    if (selShowGenre > 0) title += " - " + showsGenres[selShowGenre];
+                    ui->drawContentGrid(showsFiltered, {}, selShows, UI::TAB_SHOWS, title);
+                } else {
+                    std::string title = "Movies";
+                    if (selMovieGenre > 0) title += " - " + moviesGenres[selMovieGenre];
+                    ui->drawContentGrid(moviesFiltered, {}, selMovies, UI::TAB_MOVIES, title);
+                }
                 break;
 
             case STATE_ITEMS: {

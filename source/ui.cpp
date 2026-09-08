@@ -346,7 +346,7 @@ void UI::drawContentGrid(const std::vector<Entry>& items,
     drawRect(BOT_W - 72, 2, 68, 20, COL_BAR);
     drawText("Search", BOT_W - 64, 5, 0.38f, COL_WHITE);
 
-    drawBottomHints("A: Open  Y: Search  L/R: Menu");
+    drawBottomHints("A: Open  Y: Search  X/SELECT: Genre  L/R: Menu");
 }
 
 // Live TV guide (Menu 2). Top screen: the highlighted channel's icon, name,
