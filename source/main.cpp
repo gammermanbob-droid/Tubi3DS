@@ -4,6 +4,7 @@
 #include <vector>
 #include <cstdio>
 #include <cstdlib>
+#include <sys/stat.h>
 #include "catalog.h"
 #include "http.h"
 #include "image.h"
@@ -188,12 +189,13 @@ static void playEntry(const Entry& e) {
     }
 
     double offset = 0, seek = -1;
+    bool ok = true;
     do {
         seek = -1;
-        playerPlay(data.url, (long long)(data.duration * 10000000.0),
-                   "Tubi3DS", e.title, 0, offset, &seek,
-                   data.subtitleVtt, nullptr, "", false,
-                   data.audioUrl, data.subtitleDebug);
+        ok = playerPlay(data.url, (long long)(data.duration * 10000000.0),
+                        "Tubi3DS", e.title, 0, offset, &seek,
+                        data.subtitleVtt, nullptr, "", false,
+                        data.audioUrl, data.subtitleDebug);
         if (seek >= 0) offset = seek;
     } while (seek >= 0);
 
@@ -206,6 +208,15 @@ static void playEntry(const Entry& e) {
     }
     ui = new UI(topScreen, botScreen);
     if (liveLoaded) buildCoverTextures(liveCovers, liveCoverData, liveChannels.size());
+
+    // playerPlay() returns false on MVD init/allocation failure (Old 3DS, or
+    // out of memory) rather than actually playing anything; surface that
+    // instead of silently landing back on the grid with no explanation.
+    if (!ok) {
+        errorMsg = "Playback failed to start for \"" + e.title +
+                   "\".\n\nCheck sdmc:/3ds/pluto3ds/player_debug.txt for details.";
+        state = STATE_ERROR;
+    }
 }
 
 // ---- Software keyboard helper -----------------------------------------------
@@ -223,6 +234,14 @@ static std::string swkbdRead(const char* hint) {
 
 int main() {
     gfxInitDefault();
+    // player.cpp (copied unchanged from Pluto3DS) hardcodes its debug log
+    // path to sdmc:/3ds/pluto3ds/player_debug.txt -- fopen() there silently
+    // fails (and playback just runs without a log) unless that directory
+    // already exists, which it only would if Pluto3DS was also ever
+    // installed on this SD card. Create it here so the log is always
+    // available for diagnosing a failed/frozen playback attempt.
+    mkdir("sdmc:/3ds", 0777);
+    mkdir("sdmc:/3ds/pluto3ds", 0777);
     Result httpRes = httpcInit(4 * 1024 * 1024);
 
     bool newModel = false;
