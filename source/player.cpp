@@ -3,6 +3,7 @@
 #include "stb_image.h"
 #include "http.h"
 #include "hls.h"
+#include "mp4box.h"
 #include "segment_crypto.h"
 #include <deque>
 #include "aacdec.h"
@@ -851,6 +852,184 @@ static void dlThread(void* arg) {
     r->producerDone=true;
 }
 
+// ─── fMP4/CMAF demuxing ────────────────────────────────────────────────────
+// Tubi (unlike Pluto TV) can serve fragmented-MP4 (CMAF) HLS media playlists
+// (#EXT-X-MAP init segment + moof/mdat fragments) instead of MPEG-TS
+// segments. Each fragment is already a self-contained, exactly-sized set of
+// access units (no PES-style "wait for the next start code to know where
+// this one ends"), so rather than forcing it through DlRing's byte-oriented
+// ring + 188-byte-packet consumer loop, a fragmented playlist gets its own
+// producer thread (dlThreadFmp4) that fully demuxes each fragment itself
+// (mp4::parseFragment + Annex-B/ADTS conversion) and pushes complete,
+// ready-to-decode access units onto a small queue that the main loop in
+// playerPlay() drains straight into the existing processH264()/processAAC().
+//
+// Scope: this is the VOD/episode case (a finite playlist that ends with
+// #EXT-X-ENDLIST). Tubi's live channels aren't wired up to fMP4 yet --
+// playerRenewUrl's periodic-refresh dance and #EXT-X-DISCONTINUITY handling
+// have no equivalent here -- and audio must come from its own playlist
+// (audioUrl set, same as the existing hasSeparateAudio TS path); a fMP4
+// fragment that muxes audio and video together in one track isn't handled.
+// See playerPlay()'s fMP4-detection probe for how those cases fall back
+// safely to the existing TS path instead of starting a half-configured one.
+struct Fmp4Au {
+    std::vector<u8> data;
+    long long pts90k = -1;
+    bool keyframe = false;
+};
+struct Fmp4Queue {
+    std::deque<Fmp4Au> q;
+    LightLock lock;
+    volatile bool producerDone = false;
+    volatile bool consumerStop = false;
+};
+// Cap how many access units a producer will queue up before applying
+// backpressure -- generous enough to smooth over a slow decode without
+// letting a fast download thread build up unbounded memory (each queued
+// item is at most a couple hundred KB for a video keyframe, far less for
+// every other sample).
+static constexpr size_t FMP4_QUEUE_MAX = 48;
+
+static void fmp4QueuePush(Fmp4Queue* q, Fmp4Au&& au) {
+    while (!q->consumerStop) {
+        LightLock_Lock(&q->lock);
+        bool full = q->q.size() >= FMP4_QUEUE_MAX;
+        if (!full) q->q.push_back(std::move(au));
+        LightLock_Unlock(&q->lock);
+        if (!full) return;
+        svcSleepThread(5000000LL);   // 5ms backpressure nap
+    }
+}
+static bool fmp4QueuePop(Fmp4Queue* q, Fmp4Au& out) {
+    LightLock_Lock(&q->lock);
+    bool has = !q->q.empty();
+    if (has) { out = std::move(q->q.front()); q->q.pop_front(); }
+    LightLock_Unlock(&q->lock);
+    return has;
+}
+static size_t fmp4QueueSize(Fmp4Queue* q) {
+    LightLock_Lock(&q->lock);
+    size_t n = q->q.size();
+    LightLock_Unlock(&q->lock);
+    return n;
+}
+
+struct Fmp4Ctx {
+    std::string playlistUrl;
+    double startSec = 0;
+    FILE* dbg = nullptr;
+    Fmp4Queue* queue = nullptr;
+    const mp4::InitInfo* init = nullptr;      // owned by playerPlay(), outlives the thread
+    const mp4::TrackConfig* track = nullptr;  // the one track (video or audio) this thread demuxes
+};
+
+static void dlThreadFmp4(void* arg) {
+    Fmp4Ctx* ctx = (Fmp4Ctx*)arg;
+    Fmp4Queue* q = ctx->queue;
+    const mp4::TrackConfig& cfg = *ctx->track;
+    uint64_t last = 0; bool haveLast = false; unsigned failures = 0;
+    bool sentConfig = false;   // video only: has SPS/PPS been queued at least once yet
+    std::vector<u8> tmp(4096); // scratch for one Annex-B-framed SPS/PPS NAL
+
+    while (!q->consumerStop) {
+        Response response = get(ctx->playlistUrl);
+        if (!response.ok()) {
+            DLOG(ctx->dbg, "fmp4 playlist HTTP=%lu result=%08lX\n",
+                 (unsigned long)response.status, (unsigned long)response.error);
+            if (++failures >= 3) break;
+            svcSleepThread(1000000000LL); continue;
+        }
+        auto playlist = hls::parse(response.body);
+        DLOG(ctx->dbg, "fmp4 playlist segments=%u end=%d bytes=%lu\n",
+             (unsigned)playlist.segments.size(), playlist.end, (unsigned long)response.body.size());
+
+        bool added = false, failed = false;
+        double timeline = 0;
+        for (const auto& segment : playlist.segments) {
+            timeline += segment.duration;
+            if (ctx->startSec > 0 && segment.duration > 0 && timeline <= ctx->startSec) continue;
+            if (q->consumerStop) break;
+            if (haveLast && segment.sequence <= last) continue;
+
+            auto media = get(hls::resolve(ctx->playlistUrl, segment.uri));
+            if (!media.ok()) {
+                DLOG(ctx->dbg, "fmp4 segment fetch HTTP=%lu result=%08lX\n",
+                     (unsigned long)media.status, (unsigned long)media.error);
+                failed = true; break;
+            }
+
+            mp4::FragmentInfo finfo;
+            const u8* fdata = reinterpret_cast<const u8*>(media.body.data());
+            size_t fsize = media.body.size();
+            if (!mp4::parseFragment(fdata, fsize, *ctx->init, finfo)) {
+                DLOG(ctx->dbg, "fmp4 fragment seq=%llu: no moof found (%lu bytes)\n",
+                     (unsigned long long)segment.sequence, (unsigned long)fsize);
+                last = segment.sequence; haveLast = true; added = true; continue;
+            }
+
+            for (auto& ftrack : finfo.tracks) {
+                if (ftrack.trackId != cfg.trackId) continue;
+                for (auto& s : ftrack.samples) {
+                    if (q->consumerStop) break;
+                    if (s.size == 0) continue;
+
+                    Fmp4Au au;
+                    double ptsSec = (double)s.cts / (double)cfg.timescale;
+                    au.pts90k = (long long)(ptsSec * 90000.0 + 0.5);
+                    au.keyframe = s.keyframe;
+
+                    if (cfg.isVideo) {
+                        if (!sentConfig || s.keyframe) {
+                            for (auto& sps : cfg.spsList) {
+                                size_t w = mp4::writeAnnexBNal(sps.data(), sps.size(), tmp.data(), tmp.size());
+                                au.data.insert(au.data.end(), tmp.data(), tmp.data() + w);
+                            }
+                            for (auto& pps : cfg.ppsList) {
+                                size_t w = mp4::writeAnnexBNal(pps.data(), pps.size(), tmp.data(), tmp.size());
+                                au.data.insert(au.data.end(), tmp.data(), tmp.data() + w);
+                            }
+                            sentConfig = true;
+                        }
+                        size_t cap = (size_t)s.size * 3 + 256;
+                        std::vector<u8> dst(cap);
+                        size_t w = mp4::avccToAnnexB(fdata + s.offset, s.size, cfg.nalLengthSize,
+                                                     dst.data(), dst.size());
+                        if (w == 0) {
+                            DLOG(ctx->dbg, "fmp4 video sample seq=%llu: AVCC->AnnexB failed (size=%u)\n",
+                                 (unsigned long long)segment.sequence, s.size);
+                            continue;
+                        }
+                        au.data.insert(au.data.end(), dst.data(), dst.data() + w);
+                    } else {
+                        std::vector<u8> dst((size_t)s.size + 7);
+                        size_t w = mp4::wrapAdts(cfg, fdata + s.offset, s.size, dst.data(), dst.size());
+                        if (w == 0) {
+                            DLOG(ctx->dbg, "fmp4 audio sample seq=%llu: ADTS wrap failed (size=%u)\n",
+                                 (unsigned long long)segment.sequence, s.size);
+                            continue;
+                        }
+                        au.data.assign(dst.data(), dst.data() + w);
+                    }
+
+                    fmp4QueuePush(q, std::move(au));
+                }
+            }
+
+            DLOG(ctx->dbg, "fmp4 segment seq=%llu bytes=%lu queued=%lu\n",
+                 (unsigned long long)segment.sequence, (unsigned long)fsize,
+                 (unsigned long)fmp4QueueSize(q));
+            last = segment.sequence; haveLast = true; added = true;
+        }
+
+        if (failed) { if (++failures >= 3) break; }
+        else failures = 0;
+        if (playlist.end && !failed) break;
+        if (!added || failed) svcSleepThread(1000000000LL);
+    }
+    q->producerDone = true;
+}
+
+
 // Consumer side: copy exactly n bytes out of ring r (handling wrap). The caller
 // must have already confirmed ringUsed(r) >= n.
 static void ringTake(DlRing* r, u8* out, u32 n) {
@@ -1242,11 +1421,64 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
         fflush(dbg);
     }
 
+    // Tubi (unlike Pluto TV) can serve fragmented-MP4/CMAF HLS instead of
+    // MPEG-TS -- detected by fetching the playlist once up front (dlThread
+    // parses it again itself on its first pass either way; one small extra
+    // GET here is a trivial cost against not knowing which producer/consumer
+    // path to run before starting). VOD/episodes only for now: a fragmented
+    // playlist whose init segment can't be fetched/parsed, or that has no
+    // recognizable video track (or no audio track when a separate audioUrl
+    // was given), silently falls back to the existing TS path, which already
+    // reports this cleanly (see "Unsupported playlist container" handling in
+    // dlThread + the zero-frames-displayed check at the end of this
+    // function) rather than risking a half-configured fMP4 path.
+    bool fragmented = false;
+    mp4::InitInfo vFmp4Init, aFmp4Init;
+    const mp4::TrackConfig* vFmp4Track = nullptr;
+    const mp4::TrackConfig* aFmp4Track = nullptr;
+    {
+        Response probe = get(url);
+        if (probe.ok()) {
+            hls::Playlist pl = hls::parse(probe.body);
+            if (pl.fragmented && !pl.initSegmentUri.empty()) {
+                Response initResp = get(hls::resolve(url, pl.initSegmentUri));
+                if (initResp.ok() &&
+                    mp4::parseInit(reinterpret_cast<const u8*>(initResp.body.data()),
+                                   initResp.body.size(), vFmp4Init)) {
+                    for (auto& t : vFmp4Init.tracks) if (t.isVideo) { vFmp4Track = &t; break; }
+                }
+            }
+        }
+        if (vFmp4Track && !audioUrl.empty()) {
+            Response probeA = get(audioUrl);
+            if (probeA.ok()) {
+                hls::Playlist pla = hls::parse(probeA.body);
+                if (pla.fragmented && !pla.initSegmentUri.empty()) {
+                    Response initRespA = get(hls::resolve(audioUrl, pla.initSegmentUri));
+                    if (initRespA.ok() &&
+                        mp4::parseInit(reinterpret_cast<const u8*>(initRespA.body.data()),
+                                       initRespA.body.size(), aFmp4Init)) {
+                        for (auto& t : aFmp4Init.tracks) if (t.isAudio) { aFmp4Track = &t; break; }
+                    }
+                }
+            }
+        }
+        fragmented = vFmp4Track != nullptr && (audioUrl.empty() || aFmp4Track != nullptr);
+        if (dbg) {
+            fprintf(dbg, "fMP4 detect: fragmented=%d videoTrack=%d audioTrack=%d (audioUrl%s)\n",
+                    (int)fragmented, (int)(vFmp4Track != nullptr), (int)(aFmp4Track != nullptr),
+                    audioUrl.empty() ? " empty" : " set");
+            fflush(dbg);
+        }
+    }
+
     // Linear memory buffers (g_ring.data is the background download ring).
     // Frame FIFO slots are allocated best-effort — each holds one full-size
     // BGR565 frame; fewer slots just means less decode-ahead.
     g_ring.capacity = RING_SZ; g_ring.mask = RING_MASK;
-    g_ring.data = (u8*)linearAlloc(RING_SZ);
+    // fMP4 playback doesn't use the byte-oriented TS ring at all (see
+    // dlThreadFmp4 above) -- skip its 8 MiB allocation in that mode.
+    g_ring.data = fragmented ? nullptr : (u8*)linearAlloc(RING_SZ);
     u8* pesBuf  = (u8*)linearAlloc(PES_SZ);
     u8* nalBuf  = (u8*)linearAlloc(NAL_SZ);
     u8* audBuf  = (u8*)linearAlloc(PES_SZ);   // audio PES accumulator (ADTS frames)
@@ -1263,14 +1495,14 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
     // buffer, and New 3DS RAM is tight enough that doubling RING_SZ for every
     // separate-audio channel isn't worth it.
     bool hasSeparateAudio = !audioUrl.empty();
-    if (hasSeparateAudio) {
+    if (hasSeparateAudio && !fragmented) {
         g_ringAud.capacity = 1u * 1024 * 1024;
         g_ringAud.mask     = g_ringAud.capacity - 1;
         g_ringAud.data     = (u8*)linearAlloc(g_ringAud.capacity);
     }
 
-    if (!g_ring.data || !pesBuf || !nalBuf || !audBuf || g_fifoN < 4 ||
-        (hasSeparateAudio && !g_ringAud.data)) {
+    if ((!fragmented && !g_ring.data) || !pesBuf || !nalBuf || !audBuf || g_fifoN < 4 ||
+        (hasSeparateAudio && !fragmented && !g_ringAud.data)) {
         printf("alloc failed\n");
         if (dbg) { fprintf(dbg, "alloc failed (fifo=%d)\n", g_fifoN); fclose(dbg); }
         linearFree(g_ring.data); linearFree(pesBuf);
@@ -1407,40 +1639,73 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
     // Start the background download thread filling the ring. Same priority as the
     // main thread so the two round-robin on the core; the main thread yields often
     // (pacing sleeps, vblank waits), letting the producer keep the ring topped up.
-    g_ring.playlistUrl  = url;
-    g_ring.startSec = startSec;
-    g_ring.dbg          = dbg;
-    g_ring.boundaries.clear();
-    g_ring.head         = 0;
-    g_ring.tail         = 0;
-    g_ring.producerDone = false;
-    g_ring.consumerStop = false;
-    LightLock_Init(&g_ring.lock);
     s32 mainPrio = 0x30;
     svcGetThreadPriority(&mainPrio, CUR_THREAD_HANDLE);
-    // core 0 (same as main): equal-priority round-robin, and a shared L1 so the
-    // ring memory is trivially coherent between producer and consumer.
-    Thread dlThr = threadCreate(dlThread, &g_ring, 32 * 1024, mainPrio, 0, false);
-    if (!dlThr) g_ring.producerDone = true;
-    if (dbg) { fprintf(dbg, "dlThread=%p prio=%ld\n", (void*)dlThr, (long)mainPrio); fflush(dbg); }
-
-    // Second producer for a channel's separate audio-only playlist, same
-    // priority/core as the video download thread above.
+    Thread dlThr = nullptr;
     Thread dlThrAud = nullptr;
-    if (hasSeparateAudio) {
-        g_ringAud.playlistUrl  = audioUrl;
-        g_ringAud.startSec     = startSec;
-        g_ringAud.isAudio      = true;
-        g_ringAud.dbg          = dbg;
-        g_ringAud.boundaries.clear();
-        g_ringAud.head         = 0;
-        g_ringAud.tail         = 0;
-        g_ringAud.producerDone = false;
-        g_ringAud.consumerStop = false;
-        LightLock_Init(&g_ringAud.lock);
-        dlThrAud = threadCreate(dlThread, &g_ringAud, 32 * 1024, mainPrio, 0, false);
-        if (!dlThrAud) g_ringAud.producerDone = true;
-        if (dbg) { fprintf(dbg, "dlThreadAud=%p\n", (void*)dlThrAud); fflush(dbg); }
+    // fMP4 producer contexts/queues -- local (not globals like g_ring/
+    // g_ringAud) so they're automatically torn down with this call frame;
+    // dlThreadFmp4 only ever reaches them through the pointers baked into
+    // Fmp4Ctx, so nothing else needs to reach them by name.
+    Fmp4Queue fmp4VideoQueue, fmp4AudioQueue;
+    Fmp4Ctx   fmp4VideoCtx, fmp4AudioCtx;
+    if (!fragmented) {
+        g_ring.playlistUrl  = url;
+        g_ring.startSec = startSec;
+        g_ring.dbg          = dbg;
+        g_ring.boundaries.clear();
+        g_ring.head         = 0;
+        g_ring.tail         = 0;
+        g_ring.producerDone = false;
+        g_ring.consumerStop = false;
+        LightLock_Init(&g_ring.lock);
+        // core 0 (same as main): equal-priority round-robin, and a shared L1 so the
+        // ring memory is trivially coherent between producer and consumer.
+        dlThr = threadCreate(dlThread, &g_ring, 32 * 1024, mainPrio, 0, false);
+        if (!dlThr) g_ring.producerDone = true;
+        if (dbg) { fprintf(dbg, "dlThread=%p prio=%ld\n", (void*)dlThr, (long)mainPrio); fflush(dbg); }
+
+        // Second producer for a channel's separate audio-only playlist, same
+        // priority/core as the video download thread above.
+        if (hasSeparateAudio) {
+            g_ringAud.playlistUrl  = audioUrl;
+            g_ringAud.startSec     = startSec;
+            g_ringAud.isAudio      = true;
+            g_ringAud.dbg          = dbg;
+            g_ringAud.boundaries.clear();
+            g_ringAud.head         = 0;
+            g_ringAud.tail         = 0;
+            g_ringAud.producerDone = false;
+            g_ringAud.consumerStop = false;
+            LightLock_Init(&g_ringAud.lock);
+            dlThrAud = threadCreate(dlThread, &g_ringAud, 32 * 1024, mainPrio, 0, false);
+            if (!dlThrAud) g_ringAud.producerDone = true;
+            if (dbg) { fprintf(dbg, "dlThreadAud=%p\n", (void*)dlThrAud); fflush(dbg); }
+        }
+    } else {
+        LightLock_Init(&fmp4VideoQueue.lock);
+        fmp4VideoCtx.playlistUrl = url;
+        fmp4VideoCtx.startSec    = startSec;
+        fmp4VideoCtx.dbg         = dbg;
+        fmp4VideoCtx.queue       = &fmp4VideoQueue;
+        fmp4VideoCtx.init        = &vFmp4Init;
+        fmp4VideoCtx.track       = vFmp4Track;
+        dlThr = threadCreate(dlThreadFmp4, &fmp4VideoCtx, 32 * 1024, mainPrio, 0, false);
+        if (!dlThr) fmp4VideoQueue.producerDone = true;
+        if (dbg) { fprintf(dbg, "dlThreadFmp4(video)=%p prio=%ld\n", (void*)dlThr, (long)mainPrio); fflush(dbg); }
+
+        if (hasSeparateAudio) {
+            LightLock_Init(&fmp4AudioQueue.lock);
+            fmp4AudioCtx.playlistUrl = audioUrl;
+            fmp4AudioCtx.startSec    = startSec;
+            fmp4AudioCtx.dbg         = dbg;
+            fmp4AudioCtx.queue       = &fmp4AudioQueue;
+            fmp4AudioCtx.init        = &aFmp4Init;
+            fmp4AudioCtx.track       = aFmp4Track;
+            dlThrAud = threadCreate(dlThreadFmp4, &fmp4AudioCtx, 32 * 1024, mainPrio, 0, false);
+            if (!dlThrAud) fmp4AudioQueue.producerDone = true;
+            if (dbg) { fprintf(dbg, "dlThreadFmp4(audio)=%p\n", (void*)dlThrAud); fflush(dbg); }
+        }
     }
 
     // "Buffering…" hint at the top of the console so a stall reads as buffering
@@ -1448,12 +1713,33 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
     bool rebuf = true;
     if (!g_dbg) printf("\x1b[%d;5HBuffering...   ", ROW_STATUS);
 
-    // Prebuffer: wait until the ring holds PREBUF_SZ (or the stream ended) so a
-    // brief network dip after playback starts doesn't immediately underrun.
-    while (!stop && ringUsed(&g_ring) < PREBUF_SZ && !g_ring.producerDone) {
-        hidScanInput();
-        if (hidKeysDown() & KEY_B) { stop = true; break; }
-        svcSleepThread(10000000LL);   // 10ms
+    // Prebuffer: wait until enough is queued (or the stream ended) so a brief
+    // network dip after playback starts doesn't immediately underrun. TS uses
+    // ring bytes as the readiness signal; fMP4 has no equivalent byte count
+    // (each queued item is already a complete access unit) so it waits for a
+    // handful of queued AUs instead.
+    if (!fragmented) {
+        while (!stop && ringUsed(&g_ring) < PREBUF_SZ && !g_ring.producerDone) {
+            hidScanInput();
+            if (hidKeysDown() & KEY_B) { stop = true; break; }
+            svcSleepThread(10000000LL);   // 10ms
+        }
+    } else {
+        const size_t FMP4_PREBUF_AUS = 8;
+        while (!stop &&
+               fmp4QueueSize(&fmp4VideoQueue) < FMP4_PREBUF_AUS && !fmp4VideoQueue.producerDone) {
+            hidScanInput();
+            if (hidKeysDown() & KEY_B) { stop = true; break; }
+            svcSleepThread(10000000LL);
+        }
+        if (!stop && hasSeparateAudio) {
+            while (!stop &&
+                   fmp4QueueSize(&fmp4AudioQueue) < FMP4_PREBUF_AUS && !fmp4AudioQueue.producerDone) {
+                hidScanInput();
+                if (hidKeysDown() & KEY_B) { stop = true; break; }
+                svcSleepThread(10000000LL);
+            }
+        }
     }
 
     // A single reusable TS packet scratch (the ring hands out whole packets).
@@ -1515,8 +1801,26 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
             }
         }
     };
-    g_serviceSepAudio = hasSeparateAudio ? std::function<void(FILE*)>(
-        [&](FILE*){ drainSepAudioRing(); }) : std::function<void(FILE*)>();
+    // fMP4 counterpart to drainSepAudioRing() above: each queued item is
+    // already one complete ADTS-framed AAC sample, so there's no PID/PES
+    // accumulation to do -- just pop and decode.
+    auto drainFmp4AudioQueue = [&]() {
+        int processedAud = 0;
+        Fmp4Au au;
+        while (!stop && audio::queuedBufs() < 24 && processedAud < 64 &&
+               fmp4QueuePop(&fmp4AudioQueue, au)) {
+            if (au.pts90k >= 0) g_audNextPts = au.pts90k / 90000.0;
+            if (!au.data.empty()) processAAC(au.data.data(), (int)au.data.size(), dbg);
+            processedAud++;
+        }
+    };
+    if (hasSeparateAudio && !fragmented) {
+        g_serviceSepAudio = [&](FILE*){ drainSepAudioRing(); };
+    } else if (hasSeparateAudio && fragmented) {
+        g_serviceSepAudio = [&](FILE*){ drainFmp4AudioQueue(); };
+    } else {
+        g_serviceSepAudio = std::function<void(FILE*)>();
+    }
 
     while (!stop) {
         hidScanInput();
@@ -1630,10 +1934,11 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
             continue;
         }
 
+        int processed = 0;
+        if (!fragmented) {
         // Drain whole TS packets out of the ring. Decoding a frame paces+blits
         // inside processH264 (it may sleep); meanwhile dlThread keeps refilling the
         // ring. Cap the batch so the debug toggle and seek bar stay responsive.
-        int processed = 0;
         int batchLimit = audioOnly ? 8 : 128;
         // Music has no video pacer. Leave the compressed stream in the ring while
         // the DSP queue is comfortably full; unlike the old wait inside
@@ -1765,6 +2070,32 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
                 }
             }
         }
+        } else {
+            // fMP4: each queued item from dlThreadFmp4 is already a complete,
+            // exactly-sized access unit (no PES-style "wait for the next start
+            // code to know where this one ends" needed) -- pop ready ones and
+            // feed them straight to the existing decoder. Audio (when this
+            // playlist has a separate one) plays through drainFmp4AudioQueue()
+            // below, same as the TS path's drainSepAudioRing(); a fragmented
+            // playlist always has hasSeparateAudio true in practice here (see
+            // the fMP4-detection probe above), so no muxed-audio case is
+            // handled in this branch.
+            int batchLimit = 32;
+            Fmp4Au au;
+            while (!stop && processed < batchLimit && fmp4QueuePop(&fmp4VideoQueue, au)) {
+                processed++;
+                pktCount++;
+                if (au.pts90k >= 0) {
+                    if (firstPts < 0) { firstPts = au.pts90k; g_vidFirstPts = au.pts90k; }
+                    long long d = au.pts90k - firstPts;
+                    if (d < 0) d = 0;   // fMP4 timestamps are monotonic (no 33-bit MPEG-TS wraparound)
+                    posSec = startSec + d / 90000.0;
+                }
+                if (!au.data.empty())
+                    processH264(au.data.data(), (u32)au.data.size(), nalBuf, &mvdCfg,
+                               &mvdFirst, &stop, &frameCount, dbg, au.pts90k);
+            }
+        }
 
         // Drain the channel's separate audio-only ring the same way, into the
         // same audLen/audActive/audBuf accumulator and processAAC() the video
@@ -1772,25 +2103,31 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
         // playerPlay() call (audPid never resolves on a video-only mux), so
         // sharing that state is safe. Own PAT/PMT (pmtPidS/audPidS) and own
         // discontinuity handling, since this is a second, independent mux.
-        if (hasSeparateAudio) drainSepAudioRing();
+        if (hasSeparateAudio && !fragmented) drainSepAudioRing();
+        else if (hasSeparateAudio && fragmented) drainFmp4AudioQueue();
 
         // Display any frames that came due (also keeps video moving through
         // network stalls, when the batch loop above has nothing to decode).
-        if (vidPid >= 0) displayPump(false, false, &stop, dbg);
+        if (vidPid >= 0 || fragmented) displayPump(false, false, &stop, dbg);
 
         // One-time note when the download stream ends — distinguishes a normal
         // end-of-file from the server silently stopping mid-stream (throttling).
-        if (g_ring.producerDone && !prodDoneLogged) {
+        bool producerDoneNow = fragmented
+            ? (fmp4VideoQueue.producerDone && (!hasSeparateAudio || fmp4AudioQueue.producerDone))
+            : g_ring.producerDone;
+        if (producerDoneNow && !prodDoneLogged) {
             prodDoneLogged = true;
             if (dbg) { fprintf(dbg, "producer done: pkts=%u used=%u\n",
-                               (unsigned)pktCount, (unsigned)ringUsed(&g_ring)); fflush(dbg); }
+                               (unsigned)pktCount,
+                               (unsigned)(fragmented ? fmp4QueueSize(&fmp4VideoQueue) : ringUsed(&g_ring)));
+                       fflush(dbg); }
         }
 
         // Buffering indicator: clear once frames flow again, re-show on underrun.
         if (!g_dbg) {
             if (processed > 0) {
                 if (rebuf) { printf("\x1b[%d;5H               ", ROW_STATUS); rebuf = false; }
-            } else if (!g_ring.producerDone &&
+            } else if (!producerDoneNow &&
                        !(audioOnly && audio::queuedBufs() >= 24) && !rebuf) {
                 printf("\x1b[%d;5HBuffering...   ", ROW_STATUS); rebuf = true;
             }
@@ -1812,7 +2149,12 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
         }
 
         // Stream finished and fully drained → done.
-        if (g_ring.producerDone && ringUsed(&g_ring) < TS_SZ) break;
+        if (fragmented) {
+            bool videoEmpty = fmp4VideoQueue.producerDone && fmp4QueueSize(&fmp4VideoQueue) == 0;
+            bool audioEmpty = !hasSeparateAudio ||
+                              (fmp4AudioQueue.producerDone && fmp4QueueSize(&fmp4AudioQueue) == 0);
+            if (videoEmpty && audioEmpty) break;
+        } else if (g_ring.producerDone && ringUsed(&g_ring) < TS_SZ) break;
         // Nothing to do this pass (waiting on the network) → yield briefly.
         if (processed == 0) svcSleepThread(5000000LL);   // 5ms
     }
@@ -1825,20 +2167,27 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
     // unless the user is seeking away, in which case just drop it.
     if (!stop && seekReq < 0 && audActive && audLen > 0)
         processAAC(audBuf, (int)audLen, dbg);
-    if (!stop && seekReq < 0 && vidPid >= 0)
+    if (!stop && seekReq < 0 && (vidPid >= 0 || fragmented))
         displayPump(false, true, &stop, dbg);
 
+    bool streamDrained = fragmented
+        ? (fmp4VideoQueue.producerDone && fmp4QueueSize(&fmp4VideoQueue) == 0 &&
+           (!hasSeparateAudio || (fmp4AudioQueue.producerDone && fmp4QueueSize(&fmp4AudioQueue) == 0)))
+        : (g_ring.producerDone && ringUsed(&g_ring) < TS_SZ);
     if (finishedOut)
-        *finishedOut = !stop && seekReq < 0 &&
-                       g_ring.producerDone && ringUsed(&g_ring) < TS_SZ;
+        *finishedOut = !stop && seekReq < 0 && streamDrained;
 
     DBG("End: pkts=%u frms=%u\n", (unsigned)pktCount, (unsigned)frameCount);
     g_serviceSepAudio = nullptr;   // don't leave a hook into this frame's locals
     g_paceLog = nullptr;
     if (dbg) {
-        fprintf(dbg,"End: pkts=%u pmtPid=%d vidPid=%d dec=%u disp=%u\n",
-                (unsigned)pktCount, pmtPid, vidPid, (unsigned)frameCount,
-                (unsigned)g_dispCount);
+        if (fragmented)
+            fprintf(dbg,"End(fmp4): pkts=%u dec=%u disp=%u drained=%d\n",
+                    (unsigned)pktCount, (unsigned)frameCount, (unsigned)g_dispCount, (int)streamDrained);
+        else
+            fprintf(dbg,"End: pkts=%u pmtPid=%d vidPid=%d dec=%u disp=%u\n",
+                    (unsigned)pktCount, pmtPid, vidPid, (unsigned)frameCount,
+                    (unsigned)g_dispCount);
         fflush(dbg);
     }
 
@@ -1847,12 +2196,17 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
 
     // Stop the producer. HLS responses are finite, so an in-flight request
     // completes promptly without cancelling a continuous HTTP connection.
-    g_ring.consumerStop = true;
+    if (fragmented) {
+        fmp4VideoQueue.consumerStop = true;
+        if (hasSeparateAudio) fmp4AudioQueue.consumerStop = true;
+    } else {
+        g_ring.consumerStop = true;
+    }
     if(dlThr) { threadJoin(dlThr, U64_MAX); threadFree(dlThr); }
     if (hasSeparateAudio) {
-        g_ringAud.consumerStop = true;
+        if (!fragmented) g_ringAud.consumerStop = true;
         if(dlThrAud) { threadJoin(dlThrAud, U64_MAX); threadFree(dlThrAud); }
-        linearFree(g_ringAud.data); g_ringAud.data = nullptr;
+        if (!fragmented) { linearFree(g_ringAud.data); g_ringAud.data = nullptr; }
     }
     if (dbg) fclose(dbg);
     AACFreeDecoder(g_aac); g_aac = nullptr;

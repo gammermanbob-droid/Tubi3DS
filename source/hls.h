@@ -16,7 +16,7 @@ struct AudioRendition { std::string groupId, uri; bool isDefault=false; };
 // `subtitles` attribute, uri is a WebVTT media playlist (a list of .vtt
 // segments, not muxed into the TS stream) for that group/language.
 struct SubtitleRendition { std::string groupId, uri, language; bool isDefault=false, isForced=false; };
-struct Playlist { std::vector<Variant> variants; std::vector<Segment> segments; std::vector<AudioRendition> audio; std::vector<SubtitleRendition> subtitles; bool end=false, fragmented=false; };
+struct Playlist { std::vector<Variant> variants; std::vector<Segment> segments; std::vector<AudioRendition> audio; std::vector<SubtitleRendition> subtitles; bool end=false, fragmented=false; std::string initSegmentUri; };
 inline std::map<std::string,std::string> attributes(const std::string& text) {
     std::map<std::string,std::string> out;
     size_t p=0;
@@ -60,7 +60,7 @@ inline Playlist parse(const std::string& body) {
         }
         else if(line=="#EXT-X-DISCONTINUITY") discontinuity=true;
         else if(line=="#EXT-X-ENDLIST") out.end=true;
-        else if(line.rfind("#EXT-X-MAP:",0)==0) out.fragmented=true;
+        else if(line.rfind("#EXT-X-MAP:",0)==0) { auto a=attributes(line.substr(11)); out.fragmented=true; out.initSegmentUri=a["URI"]; }
         else if(line[0]!='#') {
             if(pending) { variant.uri=line; out.variants.push_back(variant); pending=false; }
             else { segment.uri=line; segment.sequence=sequence++; segment.discontinuity=discontinuity; out.segments.push_back(segment); discontinuity=false; }
