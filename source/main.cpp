@@ -223,8 +223,12 @@ static void playEntry(const Entry& e) {
         // No in-player guide overlay in this first cut; only the renewal
         // callback is wired, so a channel whose playlist expires mid-session
         // gets a fresh one instead of just dying.
-        playerRenewUrl = [e]() -> std::pair<std::string, std::string> {
-            Playback fresh = catalog.resolve(e);
+        // attempt starts at 1: attempt 0 (the lowest-bandwidth rendition)
+        // was already tried by the catalog.resolve(e) call above, so the
+        // first renewal should step to the next rung rather than repeat it
+        // (see the variantAttempt comment on Catalog::resolve).
+        playerRenewUrl = [e, attempt = 1]() mutable -> std::pair<std::string, std::string> {
+            Playback fresh = catalog.resolve(e, attempt++);
             return { fresh.url, fresh.audioUrl };
         };
     }

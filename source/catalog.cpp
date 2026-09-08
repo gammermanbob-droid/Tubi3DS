@@ -316,7 +316,7 @@ static std::string pickManifestUrl(const picojson::value& videoObj) {
     return "";
 }
 
-Playback Catalog::resolve(const Entry& e) {
+Playback Catalog::resolve(const Entry& e, int variantAttempt) {
     error.clear();
     Playback p;
     std::string manifestUrl = e.url;   // channels arrive with this already filled in
@@ -340,8 +340,18 @@ Playback Catalog::resolve(const Entry& e) {
 
     std::string finalUrl;
     if (!master.variants.empty()) {
-        auto v = *std::min_element(master.variants.begin(), master.variants.end(),
-                                   [](const hls::Variant& a,const hls::Variant& b){return a.bandwidth<b.bandwidth;});
+        // Sorted ascending by bandwidth so attempt 0 keeps the original
+        // lowest-bitrate choice; a nonzero variantAttempt (renewal retries
+        // only -- see the header comment) steps to the next rung up instead
+        // of landing back on the same one, and wraps rather than picking
+        // something out of range.
+        std::vector<hls::Variant> byBandwidth(master.variants.begin(), master.variants.end());
+        std::sort(byBandwidth.begin(), byBandwidth.end(),
+                  [](const hls::Variant& a,const hls::Variant& b){return a.bandwidth<b.bandwidth;});
+        size_t idx = byBandwidth.size() > 1
+                   ? (size_t)variantAttempt % byBandwidth.size()
+                   : 0;
+        const auto& v = byBandwidth[idx];
         finalUrl = hls::resolve(manifestUrl, v.uri);
         if (!v.audio.empty()) {
             std::string best;

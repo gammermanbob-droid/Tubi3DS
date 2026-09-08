@@ -792,7 +792,16 @@ static void dlThread(void* arg) {
         auto fresh=playerRenewUrl();
         const std::string& chosen = r->isAudio ? fresh.second : fresh.first;
         if(chosen.empty()) return false;
-        DLOG(r->dbg,"Session renewed; resuming from a fresh playlist URL\n");
+        // Log the new URL (query redacted, same convention as the top-of-
+        // playback "URL:" line) rather than just "renewed" -- for live
+        // channels this now cycles through the ABR ladder on each retry
+        // (see Catalog::resolve's variantAttempt), so seeing which rendition
+        // was actually picked is the difference between "still the same
+        // dead URL" and "moved to a different one" in the next debug log.
+        size_t q = chosen.find('?');
+        DLOG(r->dbg,"Session renewed; new playlist URL: %.*s%s\n",
+             (int)(q == std::string::npos ? chosen.size() : q), chosen.c_str(),
+             q == std::string::npos ? "" : "?<redacted>");
         r->playlistUrl=chosen; keyUrl.clear(); keyBytes.clear(); haveLast=false;
         LightLock_Lock(&r->lock);r->boundaries.push_back(static_cast<u32>(r->head));LightLock_Unlock(&r->lock);
         lastRenew=osGetTime(); failures=0;

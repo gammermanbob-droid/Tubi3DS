@@ -67,5 +67,17 @@ public:
     // (which normally arrives with url empty), it first fetches the title's
     // own page to read its video_resources — the same window.__data lookup
     // yt-dlp's Tubi extractor uses — before doing the same variant-select.
-    Playback resolve(const Entry& entry);
+    //
+    // variantAttempt selects which rung of the ABR ladder to use, sorted
+    // ascending by bandwidth and taken modulo the variant count: 0 (the
+    // default) is the lowest-bandwidth rendition, matching the original
+    // behavior for the first resolve of any title. A live channel's renewal
+    // path (see playerRenewUrl in main.cpp) increments this on each retry,
+    // so repeated playback failures step through progressively higher
+    // rungs instead of re-resolving the exact same URL forever — observed
+    // live-TV symptom: a specific low-bitrate rendition can be dead on
+    // Tubi's origin while the rest of that channel's ladder is healthy, and
+    // without this the renewal loop just re-picks the same dead URL every
+    // single cycle (see player_debug.txt's repeating "playlist HTTP=404").
+    Playback resolve(const Entry& entry, int variantAttempt = 0);
 };
