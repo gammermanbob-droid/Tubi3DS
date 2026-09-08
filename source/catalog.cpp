@@ -28,6 +28,47 @@ static const picojson::array& array(const picojson::value& v) {
 static const picojson::array& arrayField(const picojson::value& v,const char* key) {
     return array(field(v,key));
 }
+
+// ---- Live-channel manifest URL normalization -------------------------------
+// channels()' EPG rows carry each rendition's manifest URL as a raw JSON
+// string in video_resources[*].manifest.url, taken as-is by str() above --
+// no percent-decoding, since JSON string escaping and URL percent-encoding
+// are different layers and picojson only undoes the former. The reference
+// implementation this scraper (channels()) and its EPG shape were built
+// against, BuddyChewChew/tubi-scraper (see the channels() comment above),
+// treats that same field very differently before using it: it runs it
+// through Python's urllib.parse.unquote() (percent-decode only -- unlike
+// unquote_plus, '+' is left alone) and then strips any query string and
+// fragment entirely (scheme+netloc+path only). This code originally used
+// the raw, still-encoded, query-intact URL unchanged, which is suspected of
+// causing every rendition Catalog::resolve() derives from it to 404
+// identically and permanently for at least one live channel (NASCAR) --
+// see player_debug.txt logs cycling cleanly through 426x240/640x360/
+// 848x480/1280x720 and getting HTTP=404 on literally every one, which reads
+// far more like "the master itself is a generic/placeholder response for a
+// malformed request" than "one specific rendition is dead upstream".
+static std::string urlDecode(const std::string& s) {
+    std::string out; out.reserve(s.size());
+    for (size_t i=0; i<s.size(); ++i) {
+        if (s[i]=='%' && i+2<s.size() &&
+            isxdigit((unsigned char)s[i+1]) && isxdigit((unsigned char)s[i+2])) {
+            auto hexVal=[](char c)->int{ return c<='9' ? c-'0' : (tolower(c)-'a'+10); };
+            out += static_cast<char>((hexVal(s[i+1])<<4) | hexVal(s[i+2]));
+            i += 2;
+        } else {
+            out += s[i];
+        }
+    }
+    return out;
+}
+static std::string stripQueryFragment(const std::string& url) {
+    auto pos = url.find_first_of("?#");
+    return pos==std::string::npos ? url : url.substr(0,pos);
+}
+
+// Forward declaration: defined further down (see its own comment there), but
+// channels() below now needs it too -- see the note where it's used.
+static std::string pickManifestUrl(const picojson::value& videoObj);
 static const picojson::object& objectOf(const picojson::value& v) {
     static picojson::object empty;return v.is<picojson::object>()?v.get<picojson::object>():empty;
 }
@@ -166,10 +207,15 @@ std::vector<Entry> Catalog::channels() {
             e.title = str(row,"title");
             e.kind  = "channel";
             e.logo  = firstImage(field(row,"images"),"thumbnail");
-            for (const auto& res : arrayField(row,"video_resources")) {
-                std::string u = str(field(res,"manifest"),"url");
-                if (!u.empty()) { e.url=u; break; }
-            }
+            // Was: take the FIRST non-empty video_resources[*].manifest.url,
+            // with no regard for its "type". video_resources can (and here,
+            // demonstrably does for at least one channel -- see the NASCAR
+            // 404 investigation in resolve()'s comment) list DRM-flagged or
+            // DASH entries ahead of the actual clear HLS one; VOD's own
+            // lookup (pickManifestUrl, below) already knows to skip those
+            // and prefer hlsv3/hlsv6 -- reusing it here instead of
+            // duplicating a naive version fixes channels() the same way.
+            e.url = pickManifestUrl(row);
             for (const auto& prog : arrayField(row,"programs")) {
                 auto start=str(prog,"start_time"), stop=str(prog,"end_time");
                 if (start<=nowIso && stop>nowIso) e.now=str(prog,"title");
@@ -288,10 +334,11 @@ std::vector<Entry> Catalog::episodes(const Entry& series) {
 }
 
 // ---- Playback ----------------------------------------------------------
-// Picks the lowest-bitrate non-DRM HLS rendition, same reasoning as
-// Pluto3DS: the New 3DS's MVD hardware decoder has hard resolution/profile
-// ceilings, so the smallest stream that plays cleanly beats a bigger one
-// that doesn't decode at all.
+// Shared by both VOD (resolve()'s movie/episode branch) and live channels
+// (channels(), above) -- a video_resources array can list DRM-flagged or
+// DASH entries alongside (or instead of) the actual playable clear HLS one,
+// for either kind of content, so both need the same type-aware pick rather
+// than blindly taking video_resources[0].
 static std::string pickManifestUrl(const picojson::value& videoObj) {
     // Prefer classic segmented HLS (hlsv3/hlsv6) over anything DRM-flagged
     // (Widevine/FairPlay/PlayReady — logged by yt-dlp's Tubi extractor as
@@ -320,6 +367,22 @@ Playback Catalog::resolve(const Entry& e, int variantAttempt) {
     error.clear();
     Playback p;
     std::string manifestUrl = e.url;   // channels arrive with this already filled in
+    if (!manifestUrl.empty()) {
+        // Channel manifest URLs specifically (VOD's manifestUrl comes from
+        // pickManifestUrl() below and is left untouched) get normalized the
+        // same way the reference scraper channels()/pickManifestUrl's EPG
+        // shape was built against (BuddyChewChew/tubi-scraper) treats this
+        // exact field: percent-decoded, then stripped of any query string
+        // and fragment. This code previously used the raw, still-encoded,
+        // query-intact URL as-is -- suspected cause of a live channel where
+        // every ABR rendition Catalog::resolve() derived from the fetched
+        // master 404'd identically and permanently (see the variantAttempt
+        // comment above): consistent with Tubi's origin returning a
+        // generic/placeholder master for a malformed request rather than
+        // the real one.
+        manifestUrl = urlDecode(manifestUrl);
+        manifestUrl = stripQueryFragment(manifestUrl);
+    }
     if (manifestUrl.empty()) {
         // Movie or episode: fetch its own page (same lookup yt-dlp's Tubi
         // extractor uses) to get video_resources, which the shelf/search
