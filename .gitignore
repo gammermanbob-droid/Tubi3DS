@@ -1,0 +1,7 @@
+build/
+*.elf
+*.map
+*.smdh
+*.cia
+*.3dsx
+__pycache__/
