@@ -123,8 +123,19 @@ static const picojson::object& objectOf(const picojson::value& v) {
     static picojson::object empty;return v.is<picojson::object>()?v.get<picojson::object>():empty;
 }
 // Tubi's poster/logo URLs are protocol-relative ("//canvas-lb.tubitv.com/...").
+// Also upgrades a plain "http://" URL to "https://": get()/fetch() in
+// http.cpp refuses to even attempt anything that isn't literally https
+// (see its doc comment on Response::finalUrl and the check at the top of
+// fetch()), and Tubi's subtitle URLs (video JSON's `subtitles[].url`, see
+// pickSubtitleUrl() below) come back as plain http:// -- confirmed on real
+// hardware via catalog_debug.txt showing httpStatus=0 bytes=0 for one,
+// which is fetch()'s own immediate early-return for a non-https URL, not an
+// actual failed connection to s.adrise.tv. Since every fetch in this app
+// needs https anyway, upgrading the scheme here is strictly better than
+// leaving it and having the request never go out at all.
 static std::string fixUrl(std::string u) {
     if (u.rfind("//",0)==0) return "https:"+u;
+    if (u.rfind("http://",0)==0) return "https:"+u.substr(5);
     return u;
 }
 static std::string firstImage(const picojson::value& v,const char* key) {
@@ -547,9 +558,13 @@ static std::string pickManifestUrl(const picojson::value& videoObj) {
 // already fetched by resolve() below), each element `{url, lang}`, and
 // downloads `url` as a complete, standalone file (no HLS/segment handling
 // around it), defaulting the display language to "English" when `lang` is
-// absent. That confirms these are plain single-file subtitle downloads
-// (WebVTT, going by what an HTML5 <video> player like Tubi's web client
-// actually consumes), not a segmented HLS rendition.
+// absent. That confirms these are plain single-file subtitle downloads, not
+// a segmented HLS rendition -- but confirmed on real hardware to actually
+// be SubRip (.srt, comma-decimal timestamps), not WebVTT despite this
+// field's name (see parseVtt()'s comma-normalization in player.cpp) -- and
+// served over plain http://, not https://, which get()/fetch() refuses
+// outright (see fixUrl()'s comment above, which upgrades the scheme before
+// this is ever fetched).
 static std::string pickSubtitleUrl(const picojson::value& videoObj, std::string* langOut) {
     // English-language entry preferred to match this app's single-language
     // Playback::subtitleVtt slot (no per-language selection UI exists);

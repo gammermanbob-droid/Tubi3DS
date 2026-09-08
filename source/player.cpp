@@ -29,7 +29,7 @@ std::function<std::pair<std::string,std::string>()> playerRenewUrl;
 // aspect ratio under the MaxWidth/MaxHeight caps, so the real frame is often
 // shorter than 240 (e.g. 400x224 for 16:9). MVD must be configured with the
 // real coded dims or render() silently writes nothing.
-static constexpr u32 VID_W = 512, VID_H = 288;
+static constexpr u32 VID_W = 720, VID_H = 480;
 static constexpr u32 FB_W  = 240, FB_H  = 400;
 
 // Actual coded dimensions (updated from SPS; default to the max until parsed).
@@ -157,7 +157,17 @@ struct SubtitleCue {
     std::string text;
 };
 
-static double parseVttTime(const std::string& s) {
+static double parseVttTime(std::string s) {
+    // SubRip (.srt) uses a comma for the fractional-seconds separator
+    // ("00:05:23,456") where WebVTT uses a period ("00:05:23.456") -- this
+    // parser is fed both (Catalog::resolve() in catalog.cpp populates
+    // Playback::subtitleVtt from whatever Tubi's own subtitles[].url
+    // actually serves, which turned out to be .srt despite the field's
+    // name; see that file's comment on pickSubtitleUrl()). Without this,
+    // sscanf's %lf below stops at the comma and silently keeps only the
+    // whole-second part, e.g. "23,456" -> 23.0 -- not a hard parse failure,
+    // just up to ~1s of timing drift on every single cue.
+    for (char& c : s) if (c == ',') c = '.';
     int h = 0, m = 0;
     double sec = 0;
     if (sscanf(s.c_str(), "%d:%d:%lf", &h, &m, &sec) == 3)
@@ -816,9 +826,14 @@ static void dlThread(void* arg) {
             svcSleepThread(1000000000LL); continue;
         }
         auto playlist=hls::parse(response.body);
-        DLOG(r->dbg,"Playlist segments=%u end=%d bytes=%lu\n",(unsigned)playlist.segments.size(),playlist.end,(unsigned long)response.body.size());
+        DLOG(r->dbg,"Playlist segments=%u variants=%u fragmented=%d end=%d bytes=%lu\n",
+             (unsigned)playlist.segments.size(), (unsigned)playlist.variants.size(),
+             playlist.fragmented, playlist.end, (unsigned long)response.body.size());
+        DLOG(r->dbg,"First 100 bytes: %.*s\n", 100, response.body.c_str());
         if(playlist.fragmented || !playlist.variants.empty() || response.body.rfind("#EXTM3U",0)!=0) {
-            DLOG(r->dbg,"Unsupported playlist container\n"); break;
+            DLOG(r->dbg,"Unsupported playlist container: fragmented=%d variants=%zu startsWithEXTM3U=%d\n",
+                 playlist.fragmented, playlist.variants.size(), response.body.rfind("#EXTM3U",0)==0);
+            break;
         }
         // Resolve segment/key URIs against where this playlist fetch
         // actually landed, not r->playlistUrl itself -- get()/fetch()
@@ -968,30 +983,53 @@ static void dlThreadFmp4(void* arg) {
 
         bool added = false, failed = false;
         double timeline = 0;
+        DLOG(ctx->dbg, "fmp4 starting segment loop: %zu segments, startSec=%f\n",
+             playlist.segments.size(), ctx->startSec);
         for (const auto& segment : playlist.segments) {
             timeline += segment.duration;
             if (ctx->startSec > 0 && segment.duration > 0 && timeline <= ctx->startSec) continue;
             if (q->consumerStop) break;
             if (haveLast && segment.sequence <= last) continue;
 
-            auto media = get(hls::resolve(playlistBase, segment.uri));
+            std::string segUrl = hls::resolve(playlistBase, segment.uri);
+            DLOG(ctx->dbg, "fmp4 fetching segment seq=%llu url=%.*s%s (offset=%llu length=%llu)\n",
+                 (unsigned long long)segment.sequence,
+                 (int)(segUrl.find('?') == std::string::npos ? segUrl.size() : segUrl.find('?')),
+                 segUrl.c_str(),
+                 segUrl.find('?') == std::string::npos ? "" : "?<redacted>",
+                 (unsigned long long)segment.byteRangeOffset,
+                 (unsigned long long)segment.byteRangeLength);
+            Response media;
+            if (segment.byteRangeLength > 0) {
+                media = getRange(segUrl, segment.byteRangeOffset, segment.byteRangeLength);
+            } else {
+                media = get(segUrl);
+            }
             if (!media.ok()) {
                 DLOG(ctx->dbg, "fmp4 segment fetch HTTP=%lu result=%08lX\n",
                      (unsigned long)media.status, (unsigned long)media.error);
                 failed = true; break;
             }
+            DLOG(ctx->dbg, "fmp4 segment fetched seq=%llu bytes=%lu\n",
+                 (unsigned long long)segment.sequence, (unsigned long)media.body.size());
 
             mp4::FragmentInfo finfo;
             const u8* fdata = reinterpret_cast<const u8*>(media.body.data());
             size_t fsize = media.body.size();
+            DLOG(ctx->dbg, "fmp4 parsing fragment seq=%llu\n", (unsigned long long)segment.sequence);
             if (!mp4::parseFragment(fdata, fsize, *ctx->init, finfo)) {
                 DLOG(ctx->dbg, "fmp4 fragment seq=%llu: no moof found (%lu bytes)\n",
                      (unsigned long long)segment.sequence, (unsigned long)fsize);
                 last = segment.sequence; haveLast = true; added = true; continue;
             }
+            DLOG(ctx->dbg, "fmp4 fragment parsed: %zu tracks\n", finfo.tracks.size());
 
             for (auto& ftrack : finfo.tracks) {
+                DLOG(ctx->dbg, "fmp4 track: id=%u samples=%zu (looking for trackId=%u)\n",
+                     ftrack.trackId, ftrack.samples.size(), cfg.trackId);
                 if (ftrack.trackId != cfg.trackId) continue;
+                DLOG(ctx->dbg, "fmp4 processing %zu samples for track %u\n",
+                     ftrack.samples.size(), cfg.trackId);
                 for (auto& s : ftrack.samples) {
                     if (q->consumerStop) break;
                     if (s.size == 0) continue;
@@ -1003,18 +1041,24 @@ static void dlThreadFmp4(void* arg) {
 
                     if (cfg.isVideo) {
                         if (!sentConfig || s.keyframe) {
-                            for (auto& sps : cfg.spsList) {
-                                size_t w = mp4::writeAnnexBNal(sps.data(), sps.size(), tmp.data(), tmp.size());
+                            DLOG(ctx->dbg, "fmp4 video: sending SPS/PPS (keyframe=%d sentConfig=%d) spsList=%zu ppsList=%d\n",
+                                 s.keyframe, sentConfig, cfg.spsList.size(), cfg.ppsList.size());
+                            for (size_t i = 0; i < cfg.spsList.size(); i++) {
+                                DLOG(ctx->dbg, "fmp4 video: SPS[%zu] size=%zu\n", i, cfg.spsList[i].size());
+                                size_t w = mp4::writeAnnexBNal(cfg.spsList[i].data(), cfg.spsList[i].size(), tmp.data(), tmp.size());
                                 au.data.insert(au.data.end(), tmp.data(), tmp.data() + w);
                             }
-                            for (auto& pps : cfg.ppsList) {
-                                size_t w = mp4::writeAnnexBNal(pps.data(), pps.size(), tmp.data(), tmp.size());
+                            for (size_t i = 0; i < cfg.ppsList.size(); i++) {
+                                DLOG(ctx->dbg, "fmp4 video: PPS[%zu] size=%zu\n", i, cfg.ppsList[i].size());
+                                size_t w = mp4::writeAnnexBNal(cfg.ppsList[i].data(), cfg.ppsList[i].size(), tmp.data(), tmp.size());
                                 au.data.insert(au.data.end(), tmp.data(), tmp.data() + w);
                             }
                             sentConfig = true;
                         }
                         size_t cap = (size_t)s.size * 3 + 256;
                         std::vector<u8> dst(cap);
+                        DLOG(ctx->dbg, "fmp4 video: avccToAnnexB offset=%llu size=%u nalLen=%u\n",
+                             (unsigned long long)s.offset, s.size, cfg.nalLengthSize);
                         size_t w = mp4::avccToAnnexB(fdata + s.offset, s.size, cfg.nalLengthSize,
                                                      dst.data(), dst.size());
                         if (w == 0) {
@@ -1022,6 +1066,7 @@ static void dlThreadFmp4(void* arg) {
                                  (unsigned long long)segment.sequence, s.size);
                             continue;
                         }
+                        DLOG(ctx->dbg, "fmp4 video: annexB size=%lu\n", (unsigned long)w);
                         au.data.insert(au.data.end(), dst.data(), dst.data() + w);
                     } else {
                         std::vector<u8> dst((size_t)s.size + 7);
@@ -1034,6 +1079,7 @@ static void dlThreadFmp4(void* arg) {
                         au.data.assign(dst.data(), dst.data() + w);
                     }
 
+                    DLOG(ctx->dbg, "fmp4 pushing AU to queue (size=%lu)\n", (unsigned long)au.data.size());
                     fmp4QueuePush(q, std::move(au));
                 }
             }
@@ -1471,8 +1517,30 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
     // and removes that risk outright.
     if (runTimeTicks > 0) {
         Response probe = get(url);
+        if (dbg) {
+            fprintf(dbg, "probe: ok=%d status=%lu bytes=%lu finalUrl=%.*s%s\n",
+                    probe.ok(), (unsigned long)probe.status, (unsigned long)probe.body.size(),
+                    (int)(probe.finalUrl.find('?') == std::string::npos ? probe.finalUrl.size() : probe.finalUrl.find('?')),
+                    probe.finalUrl.c_str(),
+                    probe.finalUrl.find('?') == std::string::npos ? "" : "?<redacted>");
+            fflush(dbg);
+        }
         if (probe.ok()) {
             hls::Playlist pl = hls::parse(probe.body);
+            if (dbg) {
+                fprintf(dbg, "probe parse: fragmented=%d initSegmentUri=%s variants=%zu segments=%zu\n",
+                        pl.fragmented, pl.initSegmentUri.c_str(), pl.variants.size(), pl.segments.size());
+                // Find and log the #EXT-X-MAP line
+                size_t mapPos = probe.body.find("#EXT-X-MAP:");
+                if (mapPos != std::string::npos) {
+                    size_t endPos = probe.body.find('\n', mapPos);
+                    if (endPos == std::string::npos) endPos = probe.body.size();
+                    std::string mapLine = probe.body.substr(mapPos, endPos - mapPos);
+                    if (mapLine.size() > 200) mapLine = mapLine.substr(0, 200) + "...";
+                    fprintf(dbg, "probe EXT-X-MAP: %s\n", mapLine.c_str());
+                }
+                fflush(dbg);
+            }
             if (pl.fragmented && !pl.initSegmentUri.empty()) {
                 // Resolve against where the playlist fetch actually landed
                 // (probe.finalUrl), not the original url -- confirmed via a
@@ -1487,11 +1555,64 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
                 // its own independent parse of the very same fragmented
                 // playlist). Same root cause and same fix shape as
                 // Catalog::resolve()'s identical bug for live channels.
-                Response initResp = get(hls::resolve(probe.finalUrl, pl.initSegmentUri));
+                std::string initUrl = hls::resolve(probe.finalUrl, pl.initSegmentUri);
+                if (dbg) {
+                    size_t q = initUrl.find('?');
+                    fprintf(dbg, "probe initUrl: %.*s%s (offset=%llu length=%llu)\n",
+                            (int)(q == std::string::npos ? initUrl.size() : q),
+                            initUrl.c_str(),
+                            q == std::string::npos ? "" : "?<redacted>",
+                            (unsigned long long)pl.initSegmentOffset,
+                            (unsigned long long)pl.initSegmentLength);
+                    fflush(dbg);
+                }
+                Response initResp;
+                if (pl.initSegmentLength > 0) {
+                    initResp = getRange(initUrl, pl.initSegmentOffset, pl.initSegmentLength);
+                } else {
+                    initResp = get(initUrl);
+                }
+                if (dbg) {
+                    fprintf(dbg, "probe initResp: ok=%d status=%lu bytes=%lu\n",
+                            initResp.ok(), (unsigned long)initResp.status, (unsigned long)initResp.body.size());
+                    if (initResp.body.size() >= 8) {
+                        uint32_t boxSize = ((uint32_t)(uint8_t)initResp.body[0] << 24) |
+                                          ((uint32_t)(uint8_t)initResp.body[1] << 16) |
+                                          ((uint32_t)(uint8_t)initResp.body[2] << 8) |
+                                          (uint32_t)(uint8_t)initResp.body[3];
+                        fprintf(dbg, "probe initResp first box: size=%u type=%c%c%c%c\n",
+                                boxSize,
+                                initResp.body[4], initResp.body[5],
+                                initResp.body[6], initResp.body[7]);
+                    }
+                    fflush(dbg);
+                }
                 if (initResp.ok() &&
                     mp4::parseInit(reinterpret_cast<const u8*>(initResp.body.data()),
-                                   initResp.body.size(), vFmp4Init)) {
-                    for (auto& t : vFmp4Init.tracks) if (t.isVideo) { vFmp4Track = &t; break; }
+                                   initResp.body.size(), vFmp4Init, dbg)) {
+                    for (auto& t : vFmp4Init.tracks) {
+                        if (t.isVideo && !t.codecUnsupported) {
+                            vFmp4Track = &t;
+                            break;
+                        }
+                    }
+                    if (dbg) {
+                        bool foundUnsupported = false;
+                        for (auto& t : vFmp4Init.tracks) {
+                            if (t.isVideo && t.codecUnsupported) {
+                                foundUnsupported = true;
+                                break;
+                            }
+                        }
+                        fprintf(dbg, "probe parseInit: ok tracks=%zu videoTrack=%d unsupportedCodec=%d\n",
+                                vFmp4Init.tracks.size(), (int)(vFmp4Track != nullptr), foundUnsupported);
+                        fflush(dbg);
+                    }
+                } else {
+                    if (dbg) {
+                        fprintf(dbg, "probe parseInit: FAILED\n");
+                        fflush(dbg);
+                    }
                 }
             }
         }
@@ -1501,10 +1622,16 @@ bool playerPlay(const std::string& url, long long runTimeTicks,
                 hls::Playlist pla = hls::parse(probeA.body);
                 if (pla.fragmented && !pla.initSegmentUri.empty()) {
                     // Same fix as the video probe above.
-                    Response initRespA = get(hls::resolve(probeA.finalUrl, pla.initSegmentUri));
+                    std::string initUrlA = hls::resolve(probeA.finalUrl, pla.initSegmentUri);
+                    Response initRespA;
+                    if (pla.initSegmentLength > 0) {
+                        initRespA = getRange(initUrlA, pla.initSegmentOffset, pla.initSegmentLength);
+                    } else {
+                        initRespA = get(initUrlA);
+                    }
                     if (initRespA.ok() &&
                         mp4::parseInit(reinterpret_cast<const u8*>(initRespA.body.data()),
-                                       initRespA.body.size(), aFmp4Init)) {
+                                       initRespA.body.size(), aFmp4Init, dbg)) {
                         for (auto& t : aFmp4Init.tracks) if (t.isAudio) { aFmp4Track = &t; break; }
                     }
                 }
